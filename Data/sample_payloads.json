@@ -1,0 +1,77 @@
+{
+  "signal": {
+    "description": "Standard quantum node snapshot — produces CONVERGED state",
+    "payload": {
+      "node_id": "qnode_01",
+      "energy_delta": 0.0001,
+      "iterations": 120,
+      "confidence": 0.92,
+      "variance": 0.002
+    }
+  },
+  "signal_suspended": {
+    "description": "Low confidence — produces SUSPENDED state",
+    "payload": {
+      "node_id": "qnode_02",
+      "energy_delta": 0.0003,
+      "iterations": 80,
+      "confidence": 0.55,
+      "variance": 0.003
+    }
+  },
+  "signal_diverged": {
+    "description": "High energy_delta — produces DIVERGED state",
+    "payload": {
+      "node_id": "qnode_03",
+      "energy_delta": 0.05,
+      "iterations": 200,
+      "confidence": 0.88,
+      "variance": 0.001
+    }
+  },
+  "quantum_pipeline": {
+    "description": "Standard marine corrosion assessment",
+    "payload": {
+      "salinity": 35.2,
+      "temperature_celsius": 18.5,
+      "pH": 7.8,
+      "material_oxidation_potential": 0.44,
+      "dissolved_oxygen_mgl": 6.5,
+      "current_density_mAcm2": 0.12
+    }
+  },
+  "quantum_pipeline_high_risk": {
+    "description": "High salinity, high temperature — elevated corrosion risk",
+    "payload": {
+      "salinity": 45.0,
+      "temperature_celsius": 35.0,
+      "pH": 6.5,
+      "material_oxidation_potential": 1.2,
+      "dissolved_oxygen_mgl": 15.0,
+      "current_density_mAcm2": 0.5
+    }
+  },
+  "distributed_qapp": {
+    "description": "3-envelope propagation batch",
+    "payload": {
+      "payloads": [
+        {"node_id": "qnode_01", "energy_delta": 0.0001, "iterations": 120, "confidence": 0.92, "variance": 0.002},
+        {"node_id": "qnode_02", "energy_delta": 0.003,  "iterations": 340, "confidence": 0.87, "variance": 0.004},
+        {"node_id": "qnode_03", "energy_delta": 0.00005,"iterations": 55,  "confidence": 0.98, "variance": 0.0008}
+      ],
+      "prove_determinism": true,
+      "silent": false
+    }
+  },
+  "operational_monitor": {
+    "description": "10-event signal stream with drift zone",
+    "payload": {
+      "events": [
+        {"node_id": "qnode_01", "energy_delta": 0.0001, "iterations": 50,  "confidence": 0.93, "variance": 0.001},
+        {"node_id": "qnode_01", "energy_delta": 0.001,  "iterations": 150, "confidence": 0.72, "variance": 0.006},
+        {"node_id": "qnode_01", "energy_delta": 0.005,  "iterations": 250, "confidence": 0.58, "variance": 0.012},
+        {"node_id": "qnode_01", "energy_delta": 0.0001, "iterations": 380, "confidence": 0.92, "variance": 0.002}
+      ]
+    }
+  }
+}
