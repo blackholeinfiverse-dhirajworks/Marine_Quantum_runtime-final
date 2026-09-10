@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  runtime:
+    build:
+      context: .
+      target: quantum          # use 'core' for stdlib-only (no Aer)
+    image: marine-runtime:latest
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      RUNTIME_API_KEY: "${RUNTIME_API_KEY:?Set RUNTIME_API_KEY in .env}"
+      IBM_QUANTUM_TOKEN: "${IBM_QUANTUM_TOKEN:-}"
+      IONQ_API_KEY: "${IONQ_API_KEY:-}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      ENV: "${ENV:-production}"
+    volumes:
+      - runtime_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  runtime_logs:
