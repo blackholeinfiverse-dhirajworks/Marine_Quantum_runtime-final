@@ -446,19 +446,6 @@ async def global_error_handler(request: Request, exc: Exception):
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    reload = os.environ.get("ENV", "development") == "development"
-    logger.info(f"Starting Marine Quantum Runtime API on port {port}")
-    logger.info(f"Swagger UI: http://localhost:{port}/docs")
-    uvicorn.run(
-        "api_server:app",
-        host="0.0.0.0",
-        port=port,
-        reload=reload,
-        log_level=os.environ.get("LOG_LEVEL", "info"),
-    )
 @app.get("/")
 def home():
     return {
@@ -467,3 +454,20 @@ def home():
         "docs": "/docs",
         "health": "/health"
     }    
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    reload = os.environ.get("ENV", "development") == "development"
+    logger.info(f"Starting Marine Quantum Runtime API on port {port}")
+    logger.info(f"Swagger UI: http://localhost:{port}/docs")
+    uvicorn.run(
+      
+  
+
+        "api_server:app",
+        host="0.0.0.0",
+        port=port,
+        reload=reload,
+        log_level=os.environ.get("LOG_LEVEL", "info"),
+    )
+
