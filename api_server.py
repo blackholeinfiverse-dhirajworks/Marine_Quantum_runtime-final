@@ -459,3 +459,11 @@ if __name__ == "__main__":
         reload=reload,
         log_level=os.environ.get("LOG_LEVEL", "info"),
     )
+@app.get("/")
+def home():
+    return {
+        "project": "Marine Quantum Runtime API",
+        "status": "Running",
+        "docs": "/docs",
+        "health": "/health"
+    }    
