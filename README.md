@@ -25,20 +25,6 @@ Exit code `0` = PASS. Exit code `1` = FAIL (reason printed before exit).
 
 ---
 
-## REST API (New — for HTTP/QCG ecosystem integration)
-
-```bash
-pip install fastapi uvicorn qiskit qiskit-aer
-export RUNTIME_API_KEY=your-secret-key
-uvicorn api_server:app --reload --port 8000
-# Swagger UI → http://localhost:8000/docs
-```
-
-For the QCG ecosystem integration request, the full developer guide is in
-**`INTEGRATION_GUIDE.md`**. The developer reply is in **`QCG_DEVELOPER_REPLY.md`**.
-
----
-
 ## What's New In This Sprint
 
 This release closes the gaps identified in the prior review: capability

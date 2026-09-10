@@ -1,40 +1,25 @@
-# Marine Quantum Runtime
-# ────────────────────────────────────────────────────────────────
-# Python >= 3.8 required.
+# marine_quantum_runtime — Quantum Runtime Capability
+# BHIV Ecosystem | Marine Intelligence System
 #
-# CORE RUNTIME — zero pip installs needed
-#   run_signal.py, run_governance.py, run_distributed_qapp.py,
-#   run_operational_drift.py, run_quantum_pipeline.py all work
-#   with Python stdlib only (math, hashlib, json, dataclasses, etc.)
+# Python >= 3.8
 #
-# RECOMMENDED — enables real Aer quantum simulation
+# CORE RUNTIME (no external dependencies — stdlib only):
+#   All 4 original entry points (run_signal, run_quantum_pipeline,
+#   run_distributed_qapp, run_operational_drift) run with zero installs.
+#   The governance layer (run_governance, 46 checks) also requires no installs.
+#
+# RECOMMENDED (real Aer simulation — tested and confirmed working):
 qiskit>=1.0.0
 qiskit-aer>=0.14.0
-#fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
-pydantic>=2.0.0
-requests>=2.28.0
-qiskit>=1.0.0
-qiskit-aer>=0.14.0
-# REST API SERVER — expose runtime over HTTP
-fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
-pydantic>=2.0.0
 #
-# HTTP CLIENT MODE — RuntimeClient(base_url=...) in client.py
-requests>=2.28.0
+# OPTIONAL (for IBM Runtime execution — requires IBM_QUANTUM_TOKEN):
+# qiskit-ibm-runtime>=0.20.0
 #
-# API TEST SUITE — tests/test_api_endpoints.py and tests/test_client.py
-httpx2>=0.1.0
+# INSTALL (development / CI):
+#   pip install qiskit qiskit-aer --break-system-packages
 #
-# OPTIONAL — IBM Quantum real hardware execution
-# qiskit-ibm-runtime>=0.20.0   # also set IBM_QUANTUM_TOKEN env var
-#
-# ────────────────────────────────────────────────────────────────
-# Install groups:
-#   Core only:        (no install needed)
-#   + Quantum:        pip install qiskit qiskit-aer
-#   + API server:     pip install fastapi uvicorn pydantic
-#   + Client SDK:     pip install requests
-#   + Testing:        pip install httpx2
-#   Everything:       pip install -r requirements.txt
+# No other external dependencies. No databases. No message brokers.
+# The ecosystem integration test (run_ecosystem_integration.py, 33 checks)
+# requires qiskit + qiskit-aer for Phase 7.3 (Aer determinism) and Phase 7.4b
+# (identical execution surface proof). Without them it falls through to
+# local_simulator for those checks and the Aer-specific assertions fail.
