@@ -1,0 +1,43 @@
+=== PROVIDER HEALTH SNAPSHOT ===
+local_simulator    local_classical_simulator    AVAILABLE                 stdlib-only, always available, no external dependency
+aer                aer_simulator                AVAILABLE                 qiskit-aer installed and importable
+ibm_runtime        ibm_brisbane_proxy           UNAVAILABLE               qiskit-ibm-runtime SDK not installed
+ibm_runtime        ibm_kyiv_proxy               UNAVAILABLE               qiskit-ibm-runtime SDK not installed
+ionq               ionq_simulator_proxy         CREDENTIALS_REQUIRED      IONQ_API_KEY environment variable not set
+ionq               ionq_aria_proxy              CREDENTIALS_REQUIRED      IONQ_API_KEY environment variable not set
+
+=== PROVIDER HEALTH SUMMARY ===
+{
+  "local_simulator": {
+    "available": 1,
+    "unavailable": 0,
+    "total": 1
+  },
+  "aer": {
+    "available": 1,
+    "unavailable": 0,
+    "total": 1
+  },
+  "ibm_runtime": {
+    "available": 0,
+    "unavailable": 2,
+    "total": 2
+  },
+  "ionq": {
+    "available": 0,
+    "unavailable": 2,
+    "total": 2
+  }
+}
+
+=== BACKEND DISCOVERY ===
+local_simulator:
+  local_classical_simulator: max_qubits=24  simulator=True
+aer:
+  aer_simulator: max_qubits=29  simulator=True
+ibm_runtime:
+  ibm_brisbane_proxy: max_qubits=127  simulator=False
+  ibm_kyiv_proxy: max_qubits=127  simulator=False
+ionq:
+  ionq_simulator_proxy: max_qubits=29  simulator=True
+  ionq_aria_proxy: max_qubits=25  simulator=False

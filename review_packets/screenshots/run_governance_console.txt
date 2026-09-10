@@ -1,0 +1,200 @@
+
+================================================================
+  Marine Intelligence System — Governance Layer
+  All Missing Components — Executable Proof
+================================================================
+
+================================================================
+  PHASE 1 — Authority Matrix (Executable)
+================================================================
+
+  ── Permitted actions
+  signal + classify_state: permitted=True  reason=Ceiling 'STATE_CLASSIFICATION' satisfies required 'STATE_CLASSIFICATION'
+      ✅ PASS  signal can classify_state
+  signal + invoke_other_capability: permitted=False
+      ✅ PASS  signal CANNOT invoke_other_capability (negative authority)
+      ✅ PASS  signal blocked_by_neg=True
+
+  ── Ceiling enforcement
+  signal + set_execution_policy: permitted=False  ceiling=STATE_CLASSIFICATION
+      ✅ PASS  signal CANNOT set_execution_policy (ceiling too low)
+
+  ── Unknown action
+      ✅ PASS  Unknown action returns DENY
+
+  ── Matrix snapshot
+  Capabilities in matrix: ['signal', 'quantum_pipeline', 'distributed_qapp', 'operational_monitor']
+      ✅ PASS  All 4 capabilities in matrix
+
+  ── Audit log
+  Audit log entries: 172
+      ✅ PASS  Authority checks recorded in audit log
+
+================================================================
+  PHASE 2 — Decision Ledger
+================================================================
+  Total decisions  : 3
+  Permits          : 2
+  Denials          : 1
+  Ledger hash      : c375ab2e7cad30b88c47e169...
+      ✅ PASS  3 decisions recorded
+      ✅ PASS  2 permits
+      ✅ PASS  1 denial
+      ✅ PASS  Ledger hash is 64-char SHA-256
+      ✅ PASS  Decision IDs are deterministic SHA-256
+
+================================================================
+  PHASE 3 — Semantic Registry
+================================================================
+  Registered semantic descriptors: ['signal', 'quantum_pipeline']
+      ✅ PASS  signal semantic descriptor registered
+      ✅ PASS  quantum_pipeline semantic descriptor registered
+
+  ── Invariant check — valid event
+  Valid event invariants: {'valid': True, 'violations': []}
+      ✅ PASS  Valid event passes invariant check
+
+  ── Invariant check — bad confidence
+  Bad confidence invariants: {'valid': False, 'violations': ['confidence out of [0.0, 1.0]']}
+      ✅ PASS  Out-of-range confidence fails invariant
+
+  ── Known limitations declared
+  signal known_limitations: 4 declared
+      ✅ PASS  signal has >= 3 known limitations
+
+================================================================
+  PHASE 4 — Doctrine Registry
+================================================================
+  Registered doctrines: ['NO_DATETIME_NOW', 'NO_SILENT_FAILURE', 'NEGATIVE_AUTHORITY_REQUIRED', 'SHA256_IDS_ONLY', 'APPEND_ONLY_LOGS', 'STUBS_MUST_BE_DECLARED', 'TYPED_ATTACHMENT_REQUIRED', 'DEPENDENCY_GRAPH_ENFORCED']
+      ✅ PASS  At least 7 doctrines registered
+
+  ── All doctrines pass with correct context
+  All passed: True  violations: []
+      ✅ PASS  Correct context passes all doctrines
+
+  ── Doctrine violations caught
+  Violations detected: ['NO_DATETIME_NOW', 'NO_SILENT_FAILURE']
+      ✅ PASS  WALL_CLOCK timestamp detected as violation
+      ✅ PASS  At least 2 violations caught
+
+================================================================
+  PHASE 5 — Replay Legitimacy (Real Implementation)
+================================================================
+
+  ── First execution — PERMIT
+  Decision: PERMIT  invocation_id: d3ad48e72f75957cbfd0dc7a...
+      ✅ PASS  First execution PERMIT
+
+  ── Repeat execution — DENY (after truth recorded)
+  Decision: DENY  reason: Invocation 'd3ad48e72f75957c...' already executed. Use repla...
+      ✅ PASS  Repeat execution DENY after truth recorded
+
+  ── Record truth and replay
+  Replay verdict: REPLAY_VERIFIED  match=True
+      ✅ PASS  Identical replay returns REPLAY_VERIFIED
+
+  ── Tampered replay — REPLAY_DIVERGED
+  Tampered verdict: REPLAY_DIVERGED
+      ✅ PASS  Tampered output returns REPLAY_DIVERGED
+  Stats: permits=1  denials=1
+      ✅ PASS  Statistics tracked (1 permit, >=1 denial)
+
+================================================================
+  PHASE 6 — Dependency Graph Validation
+================================================================
+
+  ── signal — no dependencies
+  signal deps: {'valid': True, 'capability_id': 'signal', 'declared_dependencies': [], 'resolved': [], 'missing_dependencies': []}
+      ✅ PASS  signal has no dependencies — valid
+
+  ── distributed_qapp — depends on signal (registered)
+  distributed_qapp deps: valid=True  resolved=['signal']
+      ✅ PASS  distributed_qapp dependencies resolved
+
+  ── All capabilities — graph validation
+  All valid: True
+      ✅ PASS  All built-in dependencies satisfied
+
+================================================================
+  PHASE 7 — Typed Attachment Validation
+================================================================
+
+  ── Valid signal payload
+  Valid: True  errors: []
+      ✅ PASS  Valid payload passes typed validation
+
+  ── Wrong type — confidence as string
+  String confidence: valid=False  errors=["Field 'confidence': Expected float, got str"]
+      ✅ PASS  String confidence caught by typed validation
+
+  ── Out of bounds — confidence=1.5
+  confidence=1.5: valid=False  errors=["Field 'confidence': Value 1.5 above maximum 1.0"]
+      ✅ PASS  confidence=1.5 caught by typed validation
+
+  ── Negative energy_delta
+  energy_delta<0: valid=False  errors=["Field 'energy_delta': Value -0.001 below minimum 0.0"]
+      ✅ PASS  Negative energy_delta caught by typed validation
+
+  ── Missing required field
+  Missing variance: valid=False  missing=['variance']
+      ✅ PASS  Missing field caught
+
+================================================================
+  PHASE 8 — Capability Version Negotiation
+================================================================
+  signal 4.0.0 vs 4.0.0: compatible=True
+      ✅ PASS  Same major version compatible
+  signal 4.0.0 vs 3.0.0: compatible=False  reason=Major version mismatch: registered=4 consumer=3
+      ✅ PASS  Different major version incompatible
+  signal 4.0.0 vs 4.9.9: compatible=True
+      ✅ PASS  Same major, different minor = compatible
+
+================================================================
+  PHASE 9 — Conflict Detection
+================================================================
+  Status: CLEAN  conflicts: 0
+      ✅ PASS  Conflict detection runs without error
+
+================================================================
+  PHASE 10 — Hot Attach / Detach
+================================================================
+
+  ── Hot attach
+  Attach status: ATTACHED
+      ✅ PASS  Hot attach returns ATTACHED
+
+  ── Idempotent re-attach
+  Re-attach status: IDEMPOTENT
+      ✅ PASS  Same descriptor re-attach returns IDEMPOTENT
+
+  ── Hot detach
+  Detach status: DETACHED
+      ✅ PASS  Hot detach returns DETACHED
+
+================================================================
+  PHASE 11 — Metrics Export + OTel Adapter
+================================================================
+
+  ── Prometheus format
+  Prometheus output lines: 15
+      ✅ PASS  Prometheus output generated
+
+  ── OTel span export
+  OTel spans generated: 1
+      ✅ PASS  OTel span name correct
+      ✅ PASS  OTel status OK
+
+  ── Full OTel export
+  format=otel_compatible_v1  spans=1  metrics=5
+      ✅ PASS  OTel export format correct
+      ✅ PASS  OTel export has spans and metrics
+
+================================================================
+  RESULT
+================================================================
+
+  Checks passed : 46 / 46
+  Checks failed : 0 / 46
+
+  [PASS] Governance Layer — ALL CHECKS PASSED ✅
+

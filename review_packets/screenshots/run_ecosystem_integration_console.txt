@@ -1,0 +1,181 @@
+
+======================================================================
+  Marine Intelligence System — Ecosystem Integration Proof
+  Quantum Runtime Capability | Phase 7 Testing
+======================================================================
+
+======================================================================
+  PHASE 7.1 — Provider Switching Proof
+======================================================================
+
+  ── Route to local_simulator explicitly
+  Provider: local_simulator  Status: SUCCESS
+      ✅ PASS  local_simulator execution succeeds
+      ✅ PASS  Routed to requested provider
+
+  ── Switch to aer explicitly — same circuit, same interface
+  Provider: aer  Status: SUCCESS
+  Real GHZ counts: {'111': 1044, '000': 1004}
+      ✅ PASS  aer execution succeeds (real qiskit-aer)
+      ✅ PASS  Output schema identical shape to local_simulator result
+
+  ── Switching required ZERO code changes — same route_and_execute() call
+      ✅ PASS  Provider switch achieved via BackendRequirements only
+
+======================================================================
+  PHASE 7.2 — Backend Failover Proof
+======================================================================
+
+  ── Require real hardware — IBM and IonQ both unavailable, no simulator qualifies
+  Status: ROUTING_FAILED
+    {'provider': 'aer', 'outcome': 'NO_CAPABLE_BACKEND'}
+    {'provider': 'ibm_runtime', 'backend': 'ibm_brisbane_proxy', 'outcome': 'UNAVAILABLE', 'reason': "IBM Runtime execution requires qiskit-ibm-runtime SDK, a valid IBM_QUANTUM_TOKEN, and network egress to IBM's cloud API. None of these are available in this environment. This is the honestly-declared boundary of the provider abstraction proof: the interface is real, the credential/network path is not."}
+    {'provider': 'ionq', 'backend': 'ionq_aria_proxy', 'outcome': 'UNAVAILABLE', 'reason': "IonQ execution requires an IONQ_API_KEY and network egress to IonQ's cloud API. Neither is available in this environment. Interface is real and provider-agnostic; the credential/network path to real IonQ hardware/cloud-simulator is not."}
+    {'provider': 'local_simulator', 'outcome': 'NO_CAPABLE_BACKEND'}
+      ✅ PASS  Routing correctly fails (no real hardware reachable from sandbox)
+      ✅ PASS  Failover attempted >=2 providers before failing
+
+  ── Failover WOULD succeed once any real-hardware provider has credentials — proven structurally by routing logic, not by faking hardware access
+      ✅ PASS  Failover logic is exercised honestly (no silent fake success)
+
+======================================================================
+  PHASE 7.3 — Determinism Validation
+======================================================================
+
+  ── Same circuit + same provider + same seed, 5 runs (local_simulator)
+  Run 1: {'001': 1258, '101': 346, '000': 444}
+  Run 2: {'001': 1258, '101': 346, '000': 444}
+  Run 3: {'001': 1258, '101': 346, '000': 444}
+  Run 4: {'001': 1258, '101': 346, '000': 444}
+  Run 5: {'001': 1258, '101': 346, '000': 444}
+      ✅ PASS  local_simulator: 5 runs identical
+
+  ── Same circuit + same provider + same seed, 5 runs (aer — real qiskit)
+  Run 1: {'111': 1044, '000': 1004}
+  Run 2: {'111': 1044, '000': 1004}
+  Run 3: {'111': 1044, '000': 1004}
+  Run 4: {'111': 1044, '000': 1004}
+  Run 5: {'111': 1044, '000': 1004}
+      ✅ PASS  aer (real qiskit-aer): 5 runs identical
+
+======================================================================
+  PHASE 7.4 — Simulation vs Hardware Comparison
+======================================================================
+
+  ── Honest declaration
+  Real quantum hardware execution requires network egress to IBM/IonQ
+  cloud APIs, which is not permitted in this environment. This test
+  cannot produce a real simulation-vs-hardware comparison. What CAN
+  be proven: both code paths exist, share an identical interface, and
+  the hardware path fails with an explicit, honest reason rather than
+  silently returning fake data.
+
+  IBM backend health: UNAVAILABLE — qiskit-ibm-runtime SDK not installed...
+      ✅ PASS  Hardware path reports honest unavailability, not fake success
+
+======================================================================
+  PHASE 7.4b — Quantum Production Readiness
+======================================================================
+
+  ── Execution limits — enforced BEFORE backend selection
+  999-qubit circuit: LIMIT_EXCEEDED
+  Violation: ['num_qubits=999 exceeds limit=29']
+      ✅ PASS  Over-limit circuit rejected before routing
+      ✅ PASS  Violation message is human-readable
+
+  ── Noise profiles declared per backend
+  aer_simulator: is_noisy=False
+  ibm_brisbane:  is_noisy=True T1=189.0µs T2=142.0µs
+      ✅ PASS  Aer simulator correctly declared noise-free
+      ✅ PASS  IBM backend has declared T1/T2 times
+
+  ── Hardware constraints declared per backend
+  aer topology:  all-to-all (simulated)
+  IBM topology:  heavy-hex (127 qubits)  max_depth=5000
+  IonQ topology: all-to-all (25 trapped-ion qubits)  gates=['gpi', 'gpi2', 'ms']
+      ✅ PASS  All three backends have declared hardware constraints
+      ✅ PASS  IBM native gates match real heavy-hex gate set
+
+  ── Queue status reported
+  Queue: {'queue_depth': 0, 'available_backends': 2, 'total_backends': 6, 'source': 'provider_registry_health'}
+      ✅ PASS  Queue status returns available_backends count
+
+  ── Identical execution surface regardless of backend
+  local_simulator result keys: ['backend_name', 'execution_time_ms', 'is_simulator', 'measurement_counts', 'provider_name', 'seed', 'shots_used']
+  aer result keys:             ['backend_name', 'execution_time_ms', 'is_simulator', 'measurement_counts', 'provider_name', 'seed', 'shots_used']
+      ✅ PASS  Identical ExecutionResult schema from both backends
+      ✅ PASS  Provider name differs (proves different backends ran)
+
+======================================================================
+  PHASE 7.5 — Performance Benchmark (classical-simulator timing)
+======================================================================
+  NOTE: this benchmarks LOCAL CLASSICAL SIMULATION timing only.
+  It is NOT a real quantum hardware benchmark — no hardware is
+  reachable from this sandbox.
+  local_simulator    avg=0.042ms  min=0.028ms  max=0.148ms  (n=10)
+  aer                avg=96.211ms  min=93.793ms  max=103.958ms  (n=10)
+      ✅ PASS  Benchmark executed for both real backends
+
+======================================================================
+  PHASE 7.6 — Failure Injection + Recovery
+======================================================================
+
+  ── Inject a failing requirement (impossible qubit count)
+  Injected failure result: FAILED
+      ✅ PASS  Impossible requirement correctly fails (not silently succeeds)
+
+  ── Recovery — subsequent valid job on same manager still processes
+  Recovery job result: COMPLETED
+      ✅ PASS  Manager recovers — subsequent valid job succeeds after prior failure
+
+======================================================================
+  PHASE 7.7 — Distributed Execution Proof
+======================================================================
+  9 jobs submitted, nodes used: ['node_1', 'node_2', 'node_3']
+      ✅ PASS  All 3 nodes used (round-robin distribution)
+      ✅ PASS  All 9 jobs completed
+
+======================================================================
+  PHASE 7.8 — Federation Proof
+======================================================================
+
+  ── Fail-closed with nothing attached
+  Status with nothing attached: REPLAY_DENIED
+      ✅ PASS  Fails closed (REPLAY_DENIED) when no authority attached
+
+  ── Live federation against reference CanonicalReplayAuthority + PersistentHistory
+  Status with reference authority attached: SUCCESS
+      ✅ PASS  Live federation succeeds against reference authority
+      ✅ PASS  Evidence persisted (survives restart)
+
+======================================================================
+  PHASE 7.9 — Independent Replay Verification
+======================================================================
+  First execution: PERMIT
+  Replay verdict (identical output): REPLAY_VERIFIED
+      ✅ PASS  Identical replay verified
+  Replay verdict (tampered output): REPLAY_DIVERGED
+      ✅ PASS  Tampered replay correctly diverges
+
+======================================================================
+  PHASE 7.10 — Observability v2 + Dashboard Telemetry Proof
+======================================================================
+  Observability v2 report sections: ['distributed_traces', 'provider_health', 'runtime_events', 'execution_graph', 'capability_utilization', 'success_failure_trends', 'resource_utilization']
+      ✅ PASS  All 7 observability v2 sections present
+  Dashboards produced: ['replay', 'runtime', 'quantum', 'operations', 'health', 'governance']
+      ✅ PASS  All 6 dashboards produce telemetry without error
+      ✅ PASS  Exactly 6 named dashboards (Replay/Runtime/Quantum/Operations/Health/Governance)
+
+======================================================================
+  RESULT
+======================================================================
+
+  Checks passed : 33 / 33
+  Checks failed : 0 / 33
+
+  Benchmark (classical-simulator timing, NOT hardware):
+    local_simulator: avg=0.042ms over 10 runs
+    aer: avg=96.211ms over 10 runs
+
+  [PASS] Ecosystem Integration — ALL CHECKS PASSED ✅
+
