@@ -1,0 +1,49 @@
+--- a/src/runtime/runtime_observability.py
++++ b/src/runtime/runtime_observability.py
+@@ -18,21 +18,41 @@
+                 "status":self.status,"seq":self.seq,"duration_ms":self.duration_ms,
+                 "error":self.error,"payload_hash":self.payload_hash,"output_hash":self.output_hash}
+ 
++# Statuses returned when a request never reached execution — the gate that
++# stopped it did its job correctly. These are client-input/authorization
++# outcomes, not runtime or backend failures, and must not degrade health.
++_REJECTION_STATUSES = {
++    "VALIDATION_ERROR", "DEPENDENCY_ERROR", "AUTHORITY_DENIED", "REPLAY_DENIED",
++}
++
+ class _CapMetrics:
+     def __init__(self,cid):
+-        self.cid=cid; self._t=0; self._s=0; self._f=0
++        self.cid=cid; self._t=0; self._s=0; self._f=0; self._r=0
+         self._ms=0.0; self._min=float("inf"); self._max=0.0; self._last="IDLE"; self._err=None
+     def record(self,r):
+         self._t+=1; self._ms+=r.duration_ms
+         self._min=min(self._min,r.duration_ms); self._max=max(self._max,r.duration_ms)
+         self._last=r.status
+-        if r.status=="SUCCESS": self._s+=1
+-        else: self._f+=1; self._err=r.error
++        if r.status=="SUCCESS":
++            self._s+=1
++        elif r.status in _REJECTION_STATUSES:
++            # Rejected before execution (bad input, no authority, replay denied,
++            # missing dependency). Tracked for visibility, excluded from health.
++            self._r+=1; self._err=r.error
++        else:
++            # Genuine execution/runtime failure — this is what health should reflect.
++            self._f+=1; self._err=r.error
+     def to_dict(self):
+         avg=self._ms/self._t if self._t>0 else 0.0
+-        h="IDLE" if self._t==0 else "HEALTHY" if self._f==0 else "DEGRADED" if self._f/self._t<0.25 else "UNHEALTHY"
++        # Health is computed only against attempts that reached execution
++        # (successes + real failures). Rejections are excluded from the ratio.
++        executed=self._s+self._f
++        h=("IDLE" if self._t==0
++           else "HEALTHY" if self._f==0
++           else "DEGRADED" if executed==0 or self._f/executed<0.25
++           else "UNHEALTHY")
+         return {"capability_id":self.cid,"total_invocations":self._t,"success_count":self._s,
+-                "failure_count":self._f,"avg_latency_ms":round(avg,3),
++                "failure_count":self._f,"rejected_count":self._r,"avg_latency_ms":round(avg,3),
+                 "min_latency_ms":round(self._min,3) if self._t>0 else 0.0,
+                 "max_latency_ms":round(self._max,3),"last_status":self._last,"last_error":self._err,"health":h}
+ 

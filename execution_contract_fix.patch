@@ -1,0 +1,251 @@
+--- a/src/quantum/production_runtime.py
++++ b/src/quantum/production_runtime.py
+@@ -17,6 +17,9 @@
+ # circuit — the caller reads ExecutionResult in the same shape whether
+ # the backend was AerSimulator, a future IBM backend, or the local sim.
+ 
++import hashlib
++import json
++import time
+ from dataclasses import dataclass, field
+ from typing import Any, Dict, List, Optional
+ 
+@@ -27,6 +30,39 @@
+ from src.quantum.providers import provider_registry
+ from src.quantum.providers.quantum_execution_router import route_and_execute
+ from src.runtime.distributed_runtime_manager import DistributedRuntimeManager, RetryPolicy
++from src.runtime.capability_runtime import record_external_evidence
++
++
++def _record_execution_provenance(circuit: CircuitSpec, outcome: dict) -> None:
++    """
++    Every call to production_execute() — the live /api/v1/quantum/execute
++    path — writes a provenance record, whether it succeeded or not. Before
++    this, only capability-governed invocations (/api/v1/capability/{id})
++    produced provenance; direct circuit execution left no audit trail.
++    """
++    payload_hash = hashlib.sha256(
++        json.dumps(circuit.to_dict(), sort_keys=True).encode("utf-8")
++    ).hexdigest()
++    result = outcome.get("result")
++    output_hash = (
++        hashlib.sha256(json.dumps(result, sort_keys=True).encode("utf-8")).hexdigest()
++        if result else ""
++    )
++    record_external_evidence({
++        "invocation_id":            outcome.get("execution_id", "unknown"),
++        "capability_id":            "quantum_execute",
++        "source":                   "production_execute",
++        "status":                   outcome.get("status"),
++        "payload_hash":             payload_hash,
++        "output_hash":              output_hash,
++        "provider_name":            (result or {}).get("provider_name"),
++        "backend_name":             (result or {}).get("backend_name"),
++        "execution_classification": (result or {}).get("execution_classification"),
++        "shots_used":               (result or {}).get("shots_used"),
++        "seed":                     (result or {}).get("seed"),
++        "errors":                   outcome.get("errors", []),
++        "ts":                       time.time(),
++    })
+ 
+ 
+ # ── Noise model declaration (per-backend, informational) ──────────────────────
+@@ -259,14 +295,17 @@
+     # Step 1: Limit validation
+     limit_check = active_limits.validate(circuit)
+     if not limit_check["valid"]:
+-        return {
++        outcome = {
+             "status":               "LIMIT_EXCEEDED",
++            "execution_id":         None,
+             "result":               None,
+             "routing":              None,
+             "execution_limits":     {"violations": limit_check["violations"]},
+             "provider_capabilities": None,
+             "errors":               limit_check["violations"],
+         }
++        _record_execution_provenance(circuit, outcome)
++        return outcome
+ 
+     # Step 2: Backend availability check
+     caps = provider_capabilities()
+@@ -275,14 +314,17 @@
+         summary["available"] > 0 for summary in health_summary.values()
+     )
+     if not any_available:
+-        return {
++        outcome = {
+             "status":               "NO_BACKEND_AVAILABLE",
++            "execution_id":         None,
+             "result":               None,
+             "routing":              None,
+             "execution_limits":     {"active_limits": active_limits.__dict__},
+             "provider_capabilities": caps,
+             "errors":               ["No backend reporting AVAILABLE across all providers"],
+         }
++        _record_execution_provenance(circuit, outcome)
++        return outcome
+ 
+     # Step 3: Route and execute
+     if manager is not None:
+@@ -292,30 +334,41 @@
+         job = next((j for j in job_results if j["job_id"] == job_id), None)
+         routing_info = {"via": "distributed_runtime_manager", "job_id": job_id}
+         if job and job["status"] == "COMPLETED":
+-            return {
++            result = job["result"] or {}
++            result.setdefault("execution_classification",
++                               "SIMULATED" if result.get("is_simulator") else "LIVE_HARDWARE")
++            outcome = {
+                 "status":               "SUCCESS",
+-                "result":               job["result"],
++                "execution_id":         job_id,
++                "result":               result,
+                 "routing":              routing_info,
+                 "execution_limits":     {"active_limits": active_limits.__dict__},
+                 "provider_capabilities": caps,
+                 "errors":               [],
+             }
+-        return {
+-            "status":               "EXECUTION_FAILED",
+-            "result":               None,
+-            "routing":              routing_info,
+-            "execution_limits":     {"active_limits": active_limits.__dict__},
+-            "provider_capabilities": caps,
+-            "errors":               [job["error"] if job else "Job not found after queue processing"],
+-        }
++        else:
++            outcome = {
++                "status":               "EXECUTION_FAILED",
++                "execution_id":         job_id,
++                "result":               None,
++                "routing":              routing_info,
++                "execution_limits":     {"active_limits": active_limits.__dict__},
++                "provider_capabilities": caps,
++                "errors":               [job["error"] if job else "Job not found after queue processing"],
++            }
++        _record_execution_provenance(circuit, outcome)
++        return outcome
+ 
+     route_result = route_and_execute(circuit, requirements,
+                                      max_failover_attempts=active_limits.max_retries + 1)
+-    return {
++    outcome = {
+         "status":               route_result["status"],
++        "execution_id":         route_result.get("execution_id"),
+         "result":               route_result["result"],
+         "routing":              route_result["routing"],
+         "execution_limits":     {"active_limits": active_limits.__dict__},
+         "provider_capabilities": caps,
+         "errors":               route_result["errors"],
+     }
++    _record_execution_provenance(circuit, outcome)
++    return outcome
+--- a/src/quantum/providers/quantum_execution_router.py
++++ b/src/quantum/providers/quantum_execution_router.py
+@@ -5,7 +5,9 @@
+ # This is what the rest of the runtime calls. It never imports a specific
+ # provider's SDK. Adding a 5th provider requires zero changes to this file.
+ 
++import hashlib
+ import time
++import uuid
+ from typing import List, Optional
+ 
+ from src.quantum.providers.base import (
+@@ -19,6 +21,26 @@
+     pass
+ 
+ 
++def _new_execution_id(circuit: CircuitSpec) -> str:
++    """
++    Unique per-attempt execution ID. Not a determinism/replay hash (that's
++    make_payload_hash/make_output_hash in the capability layer) — this is a
++    correlation ID so a caller can trace one HTTP request to one execution
++    attempt in logs, provenance, and dashboards.
++    """
++    raw = f"{uuid.uuid4().hex}:{circuit.num_qubits}:{circuit.shots}:{circuit.seed}:{time.time()}"
++    return "exec_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
++
++
++def _classify_execution(result: ExecutionResult) -> str:
++    """
++    Explicit, unambiguous LIVE vs SIMULATED classification. Don't make callers
++    infer this from is_simulator/is_real_hardware on ExecutionResult — state
++    it as one field so API consumers can't misread it.
++    """
++    return "SIMULATED" if result.is_simulator else "LIVE_HARDWARE"
++
++
+ def route_and_execute(
+     circuit: CircuitSpec,
+     requirements: Optional[BackendRequirements] = None,
+@@ -35,7 +57,8 @@
+         routing:   {attempted providers, final provider/backend chosen}
+         errors:    list of strings
+     """
+-    requirements = requirements or BackendRequirements(min_qubits=circuit.num_qubits, min_shots=circuit.shots)
++    requirements  = requirements or BackendRequirements(min_qubits=circuit.num_qubits, min_shots=circuit.shots)
++    execution_id  = _new_execution_id(circuit)
+     attempts  = []
+     errors    = []
+ 
+@@ -70,9 +93,13 @@
+                 "provider": provider.provider_name, "backend": backend.name,
+                 "outcome": "SUCCESS",
+             })
++            result_dict = result.to_dict()
++            result_dict["execution_id"] = execution_id
++            result_dict["execution_classification"] = _classify_execution(result)
+             return {
+-                "status":  "SUCCESS",
+-                "result":  result.to_dict(),
++                "status":       "SUCCESS",
++                "execution_id": execution_id,
++                "result":       result_dict,
+                 "routing": {"attempted": attempts, "final_provider": provider.provider_name,
+                            "final_backend": backend.name, "failover_count": tried - 1},
+                 "errors":  [],
+@@ -91,16 +118,18 @@
+             })
+             errors.append(f"{provider.provider_name}/{backend.name}: {exc}")
+             return {
+-                "status":  "EXECUTION_FAILED",
+-                "result":  None,
++                "status":       "EXECUTION_FAILED",
++                "execution_id": execution_id,
++                "result":       None,
+                 "routing": {"attempted": attempts, "final_provider": None,
+                            "final_backend": None, "failover_count": tried - 1},
+                 "errors":  errors,
+             }
+ 
+     return {
+-        "status":  "ROUTING_FAILED",
+-        "result":  None,
++        "status":       "ROUTING_FAILED",
++        "execution_id": execution_id,
++        "result":       None,
+         "routing": {"attempted": attempts, "final_provider": None,
+                    "final_backend": None, "failover_count": tried},
+         "errors":  errors or ["No provider could satisfy requirements"],
+--- a/src/runtime/capability_runtime.py
++++ b/src/runtime/capability_runtime.py
+@@ -317,6 +317,17 @@
+     }
+ 
+ 
++def record_external_evidence(record: Dict[str, Any]) -> None:
++    """
++    Append a provenance record from a path that doesn't go through the full
++    invoke_capability() governance stack (e.g. direct quantum circuit
++    execution via /api/v1/quantum/execute). Uses the same persistent
++    evidence ledger so `/api/v1/governance/provenance` reflects ALL
++    executions, not just capability-governed ones.
++    """
++    _evidence_ledger.append(record)
++
++
+ def get_provenance_status() -> dict:
+     if hasattr(_evidence_ledger, "summary"):
+         summ = _evidence_ledger.summary()
