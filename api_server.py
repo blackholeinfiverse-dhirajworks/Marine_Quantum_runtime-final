@@ -76,7 +76,12 @@ from src.governance.doctrine_registry import evaluate_all as evaluate_doctrines
 from src.monitoring.observability_v2 import provider_health_report
 
 
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "info").upper())
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    LOG_LEVEL = "INFO"
+
+logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("marine_quantum_runtime")
 
 
