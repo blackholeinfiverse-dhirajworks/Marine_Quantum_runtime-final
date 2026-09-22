@@ -36,6 +36,7 @@ ARCHITECTURE NOTE:
 import os
 import sys
 import logging
+import secrets
 from typing import Any, Dict, List, Optional
 
 # Make the runtime importable regardless of working directory
@@ -44,7 +45,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 try:
-    from fastapi import FastAPI, HTTPException, Header, Depends, Request, status
+    from fastapi import FastAPI, HTTPException, Depends, Security, Request, status
+    from fastapi.security import APIKeyHeader
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel, Field
@@ -113,26 +115,49 @@ app.add_middleware(
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
+#
+# Uses fastapi.security.APIKeyHeader (not a plain Header()+Depends()) so that
+# FastAPI registers a real OpenAPI `securitySchemes` entry and attaches it to
+# every protected operation. That's what makes Swagger UI show the
+# "Authorize" button and auto-attach X-API-Key to requests after the user
+# authorizes once — a plain Header() parameter is invisible to the OpenAPI
+# security model even though it works fine at the HTTP level.
 
-_RUNTIME_API_KEY = os.environ.get("RUNTIME_API_KEY", "dev-insecure-key")
-if _RUNTIME_API_KEY == "dev-insecure-key":
+_RUNTIME_API_KEY = os.environ.get("RUNTIME_API_KEY")
+if not _RUNTIME_API_KEY:
     logger.warning(
-        "RUNTIME_API_KEY not set — using insecure dev default. "
-        "Set a real key before any production deployment."
+        "RUNTIME_API_KEY not set — the server will reject all authenticated "
+        "requests with 500 until this environment variable is configured. "
+        "Set a real, random key before any production deployment."
     )
 
+_api_key_scheme = APIKeyHeader(
+    name="X-API-Key",
+    scheme_name="APIKeyHeader",
+    description="API key issued for this deployment. Required on all protected endpoints.",
+    auto_error=False,  # let verify_api_key control the exact error response/body
+)
 
-def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    if not x_api_key or x_api_key != _RUNTIME_API_KEY:
+
+def verify_api_key(api_key: Optional[str] = Security(_api_key_scheme)) -> str:
+    if not _RUNTIME_API_KEY:
+        # Fail closed: never silently accept requests when the server itself
+        # has no configured key. This is a deployment misconfiguration, not
+        # a client error, so it's reported as 500, not 401.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="API authentication is not configured",
+        )
+    if not api_key or not secrets.compare_digest(api_key, _RUNTIME_API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key header",
             headers={"WWW-Authenticate": "ApiKey"},
         )
-    return x_api_key
+    return api_key
 
 
-Auth = Depends(verify_api_key)
+Auth = Security(verify_api_key)
 
 
 # ── Request / Response Models ──────────────────────────────────────────────────
@@ -458,7 +483,7 @@ def home():
         "status": "Running",
         "docs": "/docs",
         "health": "/health"
-    }    
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
@@ -466,91 +491,9 @@ if __name__ == "__main__":
     logger.info(f"Starting Marine Quantum Runtime API on port {port}")
     logger.info(f"Swagger UI: http://localhost:{port}/docs")
     uvicorn.run(
-      
-  
-
         "api_server:app",
         host="0.0.0.0",
         port=port,
         reload=reload,
         log_level=os.environ.get("LOG_LEVEL", "info"),
     )
-
---- a/api_server.py
-+++ b/api_server.py
-@@ -36,6 +36,7 @@
- import os
- import sys
- import logging
-+import secrets
- from typing import Any, Dict, List, Optional
- 
- # Make the runtime importable regardless of working directory
-@@ -44,7 +45,8 @@
-     sys.path.insert(0, _ROOT)
- 
- try:
--    from fastapi import FastAPI, HTTPException, Header, Depends, Request, status
-+    from fastapi import FastAPI, HTTPException, Depends, Security, Request, status
-+    from fastapi.security import APIKeyHeader
-     from fastapi.middleware.cors import CORSMiddleware
-     from fastapi.responses import JSONResponse
-     from pydantic import BaseModel, Field
-@@ -108,26 +110,49 @@
- 
- 
- # ── Auth ───────────────────────────────────────────────────────────────────────
-+#
-+# Uses fastapi.security.APIKeyHeader (not a plain Header()+Depends()) so that
-+# FastAPI registers a real OpenAPI `securitySchemes` entry and attaches it to
-+# every protected operation. That's what makes Swagger UI show the
-+# "Authorize" button and auto-attach X-API-Key to requests after the user
-+# authorizes once — a plain Header() parameter is invisible to the OpenAPI
-+# security model even though it works fine at the HTTP level.
- 
--_RUNTIME_API_KEY = os.environ.get("RUNTIME_API_KEY", "dev-insecure-key")
--if _RUNTIME_API_KEY == "dev-insecure-key":
-+_RUNTIME_API_KEY = os.environ.get("RUNTIME_API_KEY")
-+if not _RUNTIME_API_KEY:
-     logger.warning(
--        "RUNTIME_API_KEY not set — using insecure dev default. "
--        "Set a real key before any production deployment."
-+        "RUNTIME_API_KEY not set — the server will reject all authenticated "
-+        "requests with 500 until this environment variable is configured. "
-+        "Set a real, random key before any production deployment."
-     )
- 
-+_api_key_scheme = APIKeyHeader(
-+    name="X-API-Key",
-+    scheme_name="APIKeyHeader",
-+    description="API key issued for this deployment. Required on all protected endpoints.",
-+    auto_error=False,  # let verify_api_key control the exact error response/body
-+)
-+
- 
--def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
--    if not x_api_key or x_api_key != _RUNTIME_API_KEY:
-+def verify_api_key(api_key: Optional[str] = Security(_api_key_scheme)) -> str:
-+    if not _RUNTIME_API_KEY:
-+        # Fail closed: never silently accept requests when the server itself
-+        # has no configured key. This is a deployment misconfiguration, not
-+        # a client error, so it's reported as 500, not 401.
-+        raise HTTPException(
-+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-+            detail="API authentication is not configured",
-+        )
-+    if not api_key or not secrets.compare_digest(api_key, _RUNTIME_API_KEY):
-         raise HTTPException(
-             status_code=status.HTTP_401_UNAUTHORIZED,
-             detail="Invalid or missing X-API-Key header",
-             headers={"WWW-Authenticate": "ApiKey"},
-         )
--    return x_api_key
-+    return api_key
- 
- 
--Auth = Depends(verify_api_key)
-+Auth = Security(verify_api_key)
- 
- 
- # ── Request / Response Models ──────────────────────────────────────────────────
