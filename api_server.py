@@ -34,6 +34,13 @@ QCG INTEGRATION (trace IDs & instrumentation):
     - Backend classification: SIMULATED AND TESTED (Qiskit AerSimulator).
       Physical QPU execution has NOT been verified.
 
+QCG COMPATIBILITY ADAPTER (QCG itself is never modified):
+    POST /hybrid/submit    — QCG HybridSubmitRequest  -> QCG InvocationResult
+    POST /hybrid/dispatch  — QCG CapabilityDispatchRequest -> QCG InvocationResult
+    Optional env: QCG_ADAPTER_TIMEOUT_SECONDS (default 25; reports status TIMEOUT)
+                  QCG_ADAPTER_MAX_WORKERS     (default 4)
+    See docs/QCG_INTEGRATION.md.
+
 ARCHITECTURE NOTE:
     This file is a thin HTTP transport layer over the Python runtime.
     All business logic stays inside src/. This file only handles:
@@ -46,8 +53,11 @@ ARCHITECTURE NOTE:
 import os
 import sys
 import json
+import math
 import re
 import time
+import hashlib
+import concurrent.futures
 import uuid
 import logging
 import secrets
@@ -55,7 +65,7 @@ import threading
 import contextvars
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Make the runtime importable regardless of working directory
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -70,7 +80,7 @@ try:
     from fastapi.encoders import jsonable_encoder
     from fastapi.exceptions import RequestValidationError
     from starlette.exceptions import HTTPException as StarletteHTTPException
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, ValidationError
     import uvicorn
 except ImportError:
     print("ERROR: FastAPI not installed.")
@@ -194,6 +204,8 @@ async def trace_id_middleware(request: Request, call_next):
         response = await call_next(request)
     finally:
         _trace_ctx.reset(token)
+    # An endpoint may adopt a better trace identity (QCG invocation_id).
+    tid = getattr(request.state, "trace_id", tid)
     response.headers["X-Trace-ID"] = tid
     return response
 
@@ -333,7 +345,7 @@ class GenericInvokeRequest(BaseModel):
 
 
 class QCGHybridSubmitRequest(BaseModel):
-    """QCG /hybrid/submit envelope, accepted by Marine Runtime."""
+    """QCG POST /hybrid/submit request body (field names/defaults mirror QCG's HybridSubmitRequest)."""
     workload: Dict[str, Any]
     workload_type: str = "GENERAL"
     problem_size: int = Field(0, ge=0)
@@ -344,7 +356,7 @@ class QCGHybridSubmitRequest(BaseModel):
 
 
 class QCGCapabilityDispatchRequest(BaseModel):
-    """QCG /hybrid/dispatch capability envelope."""
+    """QCG POST /hybrid/dispatch request body (mirrors QCG's CapabilityDispatchRequest)."""
     service_id: str = "QCG-HYBRID-RUNTIME"
     operation: str = "hybrid_submit"
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -563,28 +575,19 @@ def quantum_corrosion(payload: QuantumPipelinePayload):
     return JSONResponse(status_code=_runtime_status_to_http(result["status"]), content=result)
 
 
-@app.post("/api/v1/quantum/execute", tags=["Quantum"], dependencies=[Auth],
-          summary="Execute an arbitrary quantum circuit via provider abstraction")
-def circuit_execute(request: CircuitExecuteRequest, http_request: Request):
+def _execute_circuit(request: CircuitExecuteRequest, trace_id: str,
+                     execution_id: Optional[str] = None) -> Tuple[int, Dict[str, Any]]:
     """
-    Accepts a provider-agnostic circuit spec and routes to the best
-    available healthy backend. Supports automatic failover.
-
-    Gate format: `{"gate": "h", "qubits": [0]}` — see Appendix A in the docs.
-
-    Optional header `X-Trace-ID` is propagated end-to-end; the effective ID is
-    returned in the `trace_id` body field and the `X-Trace-ID` response header.
-    All fields returned by the runtime are preserved; `trace_id`, `execution_id`
-    and `instrumentation` are added (plus `backend_name`, `provider_name`,
-    `is_simulator`, `measurement_counts` where the runtime result lets them be
-    derived without guessing).
+    Shared execution path used by POST /api/v1/quantum/execute and the QCG
+    adapter. Returns (http_status, body). Validation, backend selection,
+    compilation, execution, instrumentation and error handling all live here
+    exactly once; production_execute() remains the only execution pipeline.
     """
-    trace_id      = _trace_id_for(http_request)
     started_at    = _utc_now_iso()
     t0            = time.perf_counter()
     instrumentation: Dict[str, Any] = {
         "trace_id":            trace_id,
-        "execution_id":        _new_execution_id(),
+        "execution_id":        execution_id or _new_execution_id(),
         "execution_timestamp": started_at,
         "num_qubits":          request.num_qubits,
         "shots":               request.shots,
@@ -612,13 +615,13 @@ def circuit_execute(request: CircuitExecuteRequest, http_request: Request):
     problems = _validate_circuit(request.num_qubits, request.gate_sequence)
     if problems:
         _close("VALIDATION_ERROR")
-        return JSONResponse(status_code=422, content={
+        return 422, {
             "status":          "VALIDATION_ERROR",
             "trace_id":        trace_id,
             "execution_id":    instrumentation["execution_id"],
             "errors":          problems,
             "instrumentation": dict(instrumentation),
-        })
+        }
 
     # 2) Existing execution pipeline (backend selection, compilation, execution,
     #    result retrieval all happen inside production_execute — unchanged).
@@ -640,14 +643,14 @@ def circuit_execute(request: CircuitExecuteRequest, http_request: Request):
     except Exception as exc:
         logger.exception("quantum.execute unhandled error execution_id=%s", instrumentation["execution_id"])
         _close("INTERNAL_ERROR")
-        return JSONResponse(status_code=500, content={
+        return 500, {
             "status":          "INTERNAL_ERROR",
             "trace_id":        trace_id,
             "execution_id":    instrumentation["execution_id"],
             "detail":          f"Execution failed with {type(exc).__name__}. "
                                f"See server logs for trace_id={trace_id}.",
             "instrumentation": dict(instrumentation),
-        })
+        }
 
     status_str = str(result.get("status", "FAILED"))
     http_code  = _runtime_status_to_http(status_str)
@@ -679,271 +682,436 @@ def circuit_execute(request: CircuitExecuteRequest, http_request: Request):
     instrumentation["circuit_depth"] = _pick(result, "circuit_depth", kind=int)
     _close(status_str)
     body["instrumentation"] = dict(instrumentation)
-    return JSONResponse(status_code=http_code, content=body)
+    return http_code, body
+
+
+@app.post("/api/v1/quantum/execute", tags=["Quantum"], dependencies=[Auth],
+          summary="Execute an arbitrary quantum circuit via provider abstraction")
+def circuit_execute(request: CircuitExecuteRequest, http_request: Request):
+    """
+    Accepts a provider-agnostic circuit spec and routes to the best
+    available healthy backend. Supports automatic failover.
+
+    Gate format: `{"gate": "h", "qubits": [0]}` — see Appendix A in the docs.
+
+    Optional header `X-Trace-ID` is propagated end-to-end; the effective ID is
+    returned in the `trace_id` body field and the `X-Trace-ID` response header.
+    All fields returned by the runtime are preserved; `trace_id`, `execution_id`
+    and `instrumentation` are added (plus `backend_name`, `provider_name`,
+    `is_simulator`, `measurement_counts` where the runtime result lets them be
+    derived without guessing).
+    """
+    http_status, body = _execute_circuit(request, _trace_id_for(http_request))
+    return JSONResponse(status_code=http_status, content=body)
 
 
 # ── QCG compatibility adapter (Marine Runtime only) ───────────────────────────
-# QCG's web_server.py is external and is not modified. These endpoints accept
-# the QCG request envelopes, map supported circuit workloads to the existing
-# CircuitExecuteRequest, and reuse circuit_execute()/production_execute().
-# This adapter does NOT implement QCG orchestration, QUBO solving, network
-# coordination, evidence-ledger writes, or hybrid routing.
+# QCG's web_server.py is an external system and is NOT modified. These endpoints
+# accept QCG's request envelopes and return QCG's 9-key InvocationResult shape:
+#   invocation_id, service_id, operation, status, response, duration_ms,
+#   trust_method, evidence, error
+# Circuit workloads are mapped onto the existing CircuitExecuteRequest and run
+# through the shared _execute_circuit() helper (the same code path as
+# POST /api/v1/quantum/execute). This adapter does NOT implement QCG
+# orchestration, QUBO solving, network coordination, evidence-ledger writes or
+# hybrid routing.
+#
+# Honest labeling: a run on AerSimulator is reported as QUANTUM_SIMULATED /
+# SIMULATED / trust_method CLASSICAL. Marine never reports QUANTUM_LIVE: physical
+# QPU execution has not been verified for this deployment.
+
+QCG_DEFAULT_TIMEOUT_SECONDS = 25.0
+
+# Fields interpreted as circuit instructions.
+_QCG_CIRCUIT_KEYS = ("num_qubits", "gate_sequence", "shots", "seed", "preferred_provider")
+# QCG WorkloadMetadata fields (carried inside the dispatch payload by QCG).
+_QCG_METADATA_KEYS = (
+    "workload_id", "workload_type", "problem_size", "is_qubo_compatible",
+    "requires_entanglement", "requires_live_hardware", "classical_fallback_acceptable",
+)
+
+
+class QCGWorkloadError(ValueError):
+    """The QCG workload cannot be mapped onto a Marine circuit request."""
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _qcg_timeout_seconds() -> float:
+    """QCG_ADAPTER_TIMEOUT_SECONDS (default 25). Invalid/non-positive values fall back to the default."""
+    raw = os.environ.get("QCG_ADAPTER_TIMEOUT_SECONDS")
+    if raw is None or not raw.strip():
+        return QCG_DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric QCG_ADAPTER_TIMEOUT_SECONDS")
+        return QCG_DEFAULT_TIMEOUT_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("Ignoring non-positive QCG_ADAPTER_TIMEOUT_SECONDS")
+        return QCG_DEFAULT_TIMEOUT_SECONDS
+    return value
+
+
+# Bounded worker pool. A timed-out Aer run cannot be killed, so it keeps its
+# worker until it finishes; the bound stops timed-out jobs from piling up.
+_qcg_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(1, _env_int("QCG_ADAPTER_MAX_WORKERS", 4)),
+    thread_name_prefix="qcg-exec",
+)
+
+
+def _adopt_invocation_trace(request: Request, invocation_id: str) -> str:
+    """
+    Trace identity precedence:
+      1. a valid X-Trace-ID header (already applied by the middleware),
+      2. a valid QCG invocation_id (adopted as the trace ID),
+      3. the UUID the middleware generated.
+    The caller's invocation_id is always echoed back unchanged.
+    """
+    if request.headers.get("X-Trace-ID", "").strip():
+        return _trace_id_for(request)
+    candidate = (invocation_id or "").strip()
+    if candidate and _TRACE_ID_RE.match(candidate):
+        request.state.trace_id = candidate   # middleware stamps the response header from this
+        _trace_ctx.set(candidate)            # log lines for the rest of this call carry it
+        return candidate
+    return _trace_id_for(request)
+
+
+def _qcg_metadata(workload: Dict[str, Any]) -> Dict[str, Any]:
+    """Typed view of QCG WorkloadMetadata fields found inside a dispatch payload."""
+    def _flag(key: str, default: bool) -> bool:
+        value = workload.get(key, default)
+        if not isinstance(value, bool):
+            raise QCGWorkloadError(f"workload.{key} must be a boolean")
+        return value
+
+    problem_size = workload.get("problem_size", 0)
+    if isinstance(problem_size, bool) or not isinstance(problem_size, int) or problem_size < 0:
+        raise QCGWorkloadError("workload.problem_size must be a non-negative integer")
+    workload_type = workload.get("workload_type", "GENERAL")
+    if not isinstance(workload_type, str):
+        raise QCGWorkloadError("workload.workload_type must be a string")
+    return {
+        "workload_type": workload_type,
+        "problem_size": problem_size,
+        "is_qubo_compatible": _flag("is_qubo_compatible", False),
+        "requires_entanglement": _flag("requires_entanglement", False),
+        "requires_live_hardware": _flag("requires_live_hardware", False),
+        "classical_fallback_acceptable": _flag("classical_fallback_acceptable", True),
+    }
 
 
 def _qcg_circuit_request(
-    workload: Dict[str, Any],
-    *,
-    requires_live_hardware: bool = False,
-    classical_fallback_acceptable: bool = True,
-) -> CircuitExecuteRequest:
-    """Map a QCG workload containing a Marine-compatible circuit to the API model.
+    workload: Dict[str, Any], meta: Dict[str, Any]
+) -> Tuple[CircuitExecuteRequest, List[str]]:
+    """
+    Map a QCG workload carrying a Marine-compatible circuit onto CircuitExecuteRequest.
 
     Supported workload keys: num_qubits, gate_sequence, shots, seed,
-    preferred_provider. Other QCG metadata is intentionally not interpreted
-    as quantum-circuit instructions.
+    preferred_provider. QCG metadata keys are accepted and echoed. Any other key
+    is not interpreted and is returned in `ignored_fields` (never silently used).
+    Only `requires_live_hardware` changes backend selection;
+    `classical_fallback_acceptable` is echoed but does not decide it.
     """
     if not isinstance(workload, dict):
-        raise ValueError("workload must be a JSON object")
-
+        raise QCGWorkloadError("workload must be a JSON object")
     if "num_qubits" not in workload or "gate_sequence" not in workload:
-        raise ValueError(
-            "Marine Runtime currently requires workload.num_qubits and "
-            "workload.gate_sequence. QUBO or other abstract workloads must be "
-            "compiled into this circuit format before submission."
+        raise QCGWorkloadError(
+            "Marine Runtime requires workload.num_qubits and workload.gate_sequence. "
+            "QUBO or other abstract workloads must be compiled into this circuit "
+            "format before submission."
         )
+    hardware_only = meta["requires_live_hardware"]
+    data = {k: workload[k] for k in _QCG_CIRCUIT_KEYS if k in workload}
+    data["require_simulator"] = not hardware_only
+    data["require_real_hardware"] = hardware_only
+    try:
+        circuit_request = CircuitExecuteRequest(**data)
+    except ValidationError as exc:
+        # loc + message only: never echo submitted values back.
+        problems = [
+            "workload." + ".".join(str(p) for p in err.get("loc", ())) + ": " + str(err.get("msg", "invalid"))
+            for err in exc.errors()
+        ]
+        raise QCGWorkloadError("; ".join(problems) or "invalid workload")
+    ignored = sorted(k for k in workload if k not in _QCG_CIRCUIT_KEYS and k not in _QCG_METADATA_KEYS)
+    return circuit_request, ignored
 
-    # A live-hardware requirement OR refusal of classical fallback is strict:
-    # never silently run a simulator for such a request.
-    hardware_only = bool(requires_live_hardware) or not bool(classical_fallback_acceptable)
-    request_data = {
-        "num_qubits": workload["num_qubits"],
-        "gate_sequence": workload["gate_sequence"],
-        "shots": workload.get("shots", DEFAULT_SHOTS),
-        "seed": workload.get("seed", DEFAULT_SEED),
-        "preferred_provider": workload.get("preferred_provider"),
-        "require_simulator": not hardware_only,
-        "require_real_hardware": hardware_only,
-    }
-    return CircuitExecuteRequest(**request_data)
 
-
-def _qcg_invocation_result(
-    *,
-    invocation_id: str,
-    service_id: str,
-    operation: str,
-    trace_id: str,
-    execution_body: Dict[str, Any],
-    http_status: int,
-    started_at: float,
+def _qcg_envelope(
+    *, invocation_id: str, service_id: str, operation: str, status_str: str,
+    response: Any, started_at: float, trust_method: str = "CLASSICAL",
+    evidence: Optional[Dict[str, Any]] = None, error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Wrap a Marine execution result in QCG's InvocationResult envelope."""
-    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-    backend_name = _pick(execution_body, "backend_name", "backend", kind=str)
-    provider_name = _pick(execution_body, "provider_name", "provider", kind=str)
-    is_simulator = _pick(execution_body, "is_simulator", kind=bool)
+    """Exactly QCG's nine InvocationResult keys (retry_count/timestamp are added by QCG's SDK, not here)."""
+    return {
+        "invocation_id": invocation_id,
+        "service_id":    service_id,
+        "operation":     operation,
+        "status":        status_str,
+        "response":      response,
+        "duration_ms":   round((time.perf_counter() - started_at) * 1000, 2),
+        "trust_method":  trust_method,
+        "evidence":      evidence,
+        "error":         error,
+    }
 
-    if is_simulator is True:
-        classification = "QUANTUM_SIMULATED"
-        execution_path = "SIMULATOR"
-        trust_method = "CLASSICAL"
-    elif is_simulator is False:
-        classification = "QUANTUM_LIVE"
-        execution_path = "QUANTUM_BACKEND"
-        trust_method = "HYBRID"
-    else:
-        classification = "UNKNOWN"
-        execution_path = "UNKNOWN"
-        # Conservative: do not label an unclassified backend as live quantum.
-        trust_method = "CLASSICAL"
+
+def _qcg_counts_hash(counts: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(counts, dict):
+        return None
+    canonical = json.dumps(counts, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _qcg_execution_envelope(
+    *, invocation_id: str, service_id: str, operation: str, trace_id: str,
+    execution_body: Dict[str, Any], http_status: int, started_at: float,
+    request_metadata: Dict[str, Any], ignored_fields: List[str],
+    timed_out: bool = False, background_note: Optional[str] = None,
+) -> Dict[str, Any]:
+    backend_name  = _pick(execution_body, "backend_name", "backend", kind=str)
+    provider_name = _pick(execution_body, "provider_name", "provider", kind=str)
+    counts        = _pick(execution_body, "measurement_counts", "counts", kind=dict)
+    is_sim        = _pick(execution_body, "is_simulator", kind=bool)
+    if is_sim is False and backend_name == VERIFIED_BACKEND:
+        is_sim = None   # contradictory: AerSimulator is never a physical QPU
 
     runtime_status = str(execution_body.get("status", "FAILED")).upper()
-    succeeded = 200 <= http_status < 300 and runtime_status == "SUCCESS"
-    error_value = execution_body.get("detail") or execution_body.get("errors")
-    if isinstance(error_value, list):
-        error_value = "; ".join(str(item) for item in error_value)
-    error_text = None if succeeded else str(error_value or runtime_status)
+    succeeded = (not timed_out) and 200 <= http_status < 300 and runtime_status == "SUCCESS"
 
+    if succeeded and is_sim is True:
+        classification, path, environment = "QUANTUM_SIMULATED", "SIMULATED", "SIMULATOR"
+    elif succeeded:
+        # Runtime did not positively identify a simulator. Never claim live hardware.
+        classification, path, environment = "UNVERIFIED", "UNVERIFIED", "UNVERIFIED"
+    else:
+        # QCG block rule: nothing (usable) executed -> CLASSICAL / BLOCKED.
+        classification, path, environment = "CLASSICAL", "BLOCKED", "NONE"
+    trust_method = "CLASSICAL"   # QCG maps simulators to CLASSICAL; Marine never emits HYBRID trust
+
+    if timed_out:
+        status_str = "TIMEOUT"
+    else:
+        status_str = "SUCCESS" if succeeded else "FAILED"
+
+    error_text: Optional[str] = None
+    if not succeeded:
+        error_value = execution_body.get("detail") or execution_body.get("errors")
+        if isinstance(error_value, list):
+            error_value = "; ".join(str(item) for item in error_value)
+        error_text = str(error_value or runtime_status)
+
+    result_hash = _qcg_counts_hash(counts) if succeeded else None
     response_payload = {
-        "orchestrator_result": execution_body,
-        "classification": classification,
-        "execution_path": execution_path,
-        "provider_id": provider_name,
-        "backend_name": backend_name,
-        "confidence": None,
-        "result_hash": None,
-        "bhex_ready": None,
-        "provenance_available": False,
+        "trace_id":                        trace_id,
+        "classification":                  classification,
+        "execution_path":                  path,
+        "execution_environment":           environment,
+        "is_simulator":                    is_sim if succeeded else None,
+        "physical_qpu_execution_verified": False,
+        "provider_id":                     provider_name,
+        "backend_name":                    backend_name,
+        "measurement_counts":              counts if succeeded else None,
+        "confidence":                      None,
+        "result_hash":                     result_hash,
+        "bhex_ready":                      None,
+        "provenance_available":            False,
+        "request_metadata":                request_metadata,
+        "ignored_fields":                  ignored_fields,
+        "marine_execution_result":         None if timed_out else execution_body,
     }
-    return {
-        "invocation_id": invocation_id or trace_id,
-        "service_id": service_id,
-        "operation": operation,
-        "status": "SUCCESS" if succeeded else "FAILED",
-        "response": response_payload if succeeded else response_payload,
-        "duration_ms": duration_ms,
-        "trust_method": trust_method,
-        "evidence": {
-            "trace_id": trace_id,
-            "classification": classification,
-            "execution_path": execution_path,
+    if background_note:
+        response_payload["background_execution"] = background_note
+    return _qcg_envelope(
+        invocation_id=invocation_id, service_id=service_id, operation=operation,
+        status_str=status_str, response=response_payload, started_at=started_at,
+        trust_method=trust_method, error=error_text,
+        evidence={
+            "trace_id":             trace_id,
+            "execution_id":         execution_body.get("execution_id"),
+            "classification":       classification,
+            "execution_path":       path,
+            "backend_name":         backend_name,
+            "result_hash":          result_hash,
             "provenance_available": False,
         },
-        "error": error_text,
+    )
+
+
+def _qcg_failure_envelope(
+    *, invocation_id: str, service_id: str, operation: str, trace_id: str,
+    started_at: float, error: str, status_str: str = "FAILED",
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    response = {
+        "trace_id": trace_id, "classification": "CLASSICAL", "execution_path": "BLOCKED",
+        "execution_environment": "NONE", "physical_qpu_execution_verified": False,
     }
+    response.update(extra or {})
+    return _qcg_envelope(
+        invocation_id=invocation_id, service_id=service_id, operation=operation,
+        status_str=status_str, response=response, started_at=started_at, error=error,
+        evidence={"trace_id": trace_id, "classification": "CLASSICAL",
+                  "execution_path": "BLOCKED", "provenance_available": False},
+    )
 
 
 def _run_qcg_hybrid_workload(
-    workload: Dict[str, Any],
-    http_request: Request,
-    *,
-    invocation_id: str = "",
-    service_id: str = "MARINE-QUANTUM-RUNTIME",
-    operation: str = "hybrid_submit",
-    workload_type: str = "GENERAL",
-    problem_size: int = 0,
-    is_qubo_compatible: bool = False,
-    requires_entanglement: bool = False,
-    requires_live_hardware: bool = False,
-    classical_fallback_acceptable: bool = True,
+    workload: Any, http_request: Request, *, trace_id: str, invocation_id: str,
+    service_id: str, operation: str, meta: Optional[Dict[str, Any]] = None,
 ) -> JSONResponse:
-    trace_id = _trace_id_for(http_request)
     started_at = time.perf_counter()
 
+    # 1) Map the QCG workload -> CircuitExecuteRequest (no execution yet).
     try:
-        circuit_request = _qcg_circuit_request(
-            workload,
-            requires_live_hardware=requires_live_hardware,
-            classical_fallback_acceptable=classical_fallback_acceptable,
-        )
-    except Exception as exc:
-        body = {
-            "status": "VALIDATION_ERROR",
-            "trace_id": trace_id,
-            "detail": str(exc),
-        }
-        wrapped = _qcg_invocation_result(
-            invocation_id=invocation_id,
-            service_id=service_id,
-            operation=operation,
-            trace_id=trace_id,
-            execution_body=body,
-            http_status=422,
-            started_at=started_at,
-        )
-        return JSONResponse(status_code=422, content=wrapped)
+        if not isinstance(workload, dict):
+            raise QCGWorkloadError("workload must be a JSON object")
+        meta = meta if meta is not None else _qcg_metadata(workload)
+        circuit_request, ignored = _qcg_circuit_request(workload, meta)
+    except QCGWorkloadError as exc:
+        return JSONResponse(status_code=422, content=_qcg_failure_envelope(
+            invocation_id=invocation_id, service_id=service_id, operation=operation,
+            trace_id=trace_id, started_at=started_at, error=str(exc),
+        ))
 
-    # Reuse the exact existing execution endpoint and therefore the existing
-    # provider selection, validation, compilation, instrumentation and logging.
-    execution_response = circuit_execute(circuit_request, http_request)
-    execution_body = json.loads(execution_response.body.decode("utf-8"))
-    wrapped = _qcg_invocation_result(
-        invocation_id=invocation_id,
-        service_id=service_id,
-        operation=operation,
-        trace_id=trace_id,
-        execution_body=execution_body,
-        http_status=execution_response.status_code,
-        started_at=started_at,
+    # 2) Run the shared execution helper under a timeout.
+    execution_id = _new_execution_id()
+    timeout_s = _qcg_timeout_seconds()
+    ctx = contextvars.copy_context()   # carries the trace ID into the worker thread
+    future = _qcg_executor.submit(ctx.run, _execute_circuit, circuit_request, trace_id, execution_id)
+    try:
+        http_status, execution_body = future.result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        if future.done():
+            raise   # the worker itself raised TimeoutError; not an adapter timeout
+        cancelled = future.cancel()   # only succeeds if it has not started yet
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+        logger.warning("qcg.dispatch TIMEOUT execution_id=%s after %.1fs cancelled_before_start=%s",
+                       execution_id, timeout_s, cancelled)
+        _record_execution({
+            "trace_id": trace_id, "execution_id": execution_id,
+            "execution_timestamp": _utc_now_iso(),
+            "num_qubits": circuit_request.num_qubits, "shots": circuit_request.shots,
+            "seed": circuit_request.seed, "gate_count": len(circuit_request.gate_sequence),
+            "logical_depth": _logical_depth(circuit_request.gate_sequence),
+            "circuit_depth": None, "backend_name": None,
+            "duration_ms": elapsed_ms, "execution_status": "TIMEOUT",
+        })
+        note = ("CANCELLED_BEFORE_START" if cancelled else
+                "MAY_STILL_BE_RUNNING: the run could not be cancelled and may finish in the "
+                "background; its result is discarded and is NOT reported as successful.")
+        envelope = _qcg_execution_envelope(
+            invocation_id=invocation_id, service_id=service_id, operation=operation,
+            trace_id=trace_id,
+            execution_body={"status": "TIMEOUT", "execution_id": execution_id,
+                            "detail": f"Execution exceeded the {timeout_s:g}s adapter timeout."},
+            http_status=504, started_at=started_at, request_metadata=meta,
+            ignored_fields=ignored, timed_out=True, background_note=note,
+        )
+        return JSONResponse(status_code=504, content=envelope)
+    except Exception as exc:
+        logger.exception("qcg.dispatch unexpected worker failure execution_id=%s", execution_id)
+        return JSONResponse(status_code=500, content=_qcg_failure_envelope(
+            invocation_id=invocation_id, service_id=service_id, operation=operation,
+            trace_id=trace_id, started_at=started_at,
+            error=f"Execution failed with {type(exc).__name__}. See server logs for trace_id={trace_id}.",
+        ))
+
+    envelope = _qcg_execution_envelope(
+        invocation_id=invocation_id, service_id=service_id, operation=operation,
+        trace_id=trace_id, execution_body=execution_body, http_status=http_status,
+        started_at=started_at, request_metadata=meta, ignored_fields=ignored,
     )
-    wrapped["response"]["request_metadata"] = {
-        "workload_type": workload_type,
-        "problem_size": problem_size,
-        "is_qubo_compatible": is_qubo_compatible,
-        "requires_entanglement": requires_entanglement,
-        "requires_live_hardware": requires_live_hardware,
-        "classical_fallback_acceptable": classical_fallback_acceptable,
-    }
-    return JSONResponse(status_code=execution_response.status_code, content=wrapped)
+    return JSONResponse(status_code=http_status, content=envelope)
+
+
+def _qcg_simple_operation(
+    fn, *, trace_id: str, invocation_id: str, service_id: str, operation: str,
+) -> JSONResponse:
+    """health_check / list_providers: read-only, no execution."""
+    started_at = time.perf_counter()
+    try:
+        result = fn()
+    except Exception as exc:
+        logger.exception("qcg.dispatch operation=%s failed", operation)
+        return JSONResponse(status_code=500, content=_qcg_failure_envelope(
+            invocation_id=invocation_id, service_id=service_id, operation=operation,
+            trace_id=trace_id, started_at=started_at,
+            error=f"Operation failed with {type(exc).__name__}. See server logs for trace_id={trace_id}.",
+        ))
+    return JSONResponse(content=_qcg_envelope(
+        invocation_id=invocation_id, service_id=service_id, operation=operation,
+        status_str="SUCCESS", response=jsonable_encoder(result), started_at=started_at,
+        evidence={"trace_id": trace_id, "provenance_available": False},
+    ))
 
 
 @app.post("/hybrid/submit", tags=["QCG Compatibility"], dependencies=[Auth],
           summary="QCG-compatible hybrid workload submission")
 def qcg_hybrid_submit(payload: QCGHybridSubmitRequest, http_request: Request):
-    """Accept QCG's HybridSubmitRequest and execute supported circuit workloads."""
+    """
+    Accepts QCG's HybridSubmitRequest. `workload` must carry a Marine circuit
+    (`num_qubits`, `gate_sequence`, optional `shots`/`seed`/`preferred_provider`).
+    Returns a QCG InvocationResult. Simulator runs are labeled QUANTUM_SIMULATED.
+    """
+    trace_id = _trace_id_for(http_request)
+    meta = {
+        "workload_type": payload.workload_type,
+        "problem_size": payload.problem_size,
+        "is_qubo_compatible": payload.is_qubo_compatible,
+        "requires_entanglement": payload.requires_entanglement,
+        "requires_live_hardware": payload.requires_live_hardware,
+        "classical_fallback_acceptable": payload.classical_fallback_acceptable,
+    }
     return _run_qcg_hybrid_workload(
-        payload.workload,
-        http_request,
-        service_id="MARINE-QUANTUM-RUNTIME",
-        operation="hybrid_submit",
-        workload_type=payload.workload_type,
-        problem_size=payload.problem_size,
-        is_qubo_compatible=payload.is_qubo_compatible,
-        requires_entanglement=payload.requires_entanglement,
-        requires_live_hardware=payload.requires_live_hardware,
-        classical_fallback_acceptable=payload.classical_fallback_acceptable,
+        payload.workload, http_request, trace_id=trace_id, invocation_id=trace_id,
+        service_id="MARINE-QUANTUM-RUNTIME", operation="hybrid_submit", meta=meta,
     )
 
 
 @app.post("/hybrid/dispatch", tags=["QCG Compatibility"], dependencies=[Auth],
           summary="QCG-compatible capability dispatch")
 def qcg_hybrid_dispatch(payload: QCGCapabilityDispatchRequest, http_request: Request):
-    """Accept QCG's capability dispatch envelope without changing QCG itself."""
-    trace_id = _trace_id_for(http_request)
+    """
+    Accepts QCG's CapabilityDispatchRequest. Supported operations:
+    `hybrid_submit` (circuit execution), `health_check`, `list_providers`.
+    Any other operation returns status SERVICE_NOT_FOUND.
+    Trace identity: X-Trace-ID header, else `invocation_id`, else a generated UUID.
+    """
+    trace_id = _adopt_invocation_trace(http_request, payload.invocation_id)
     invocation_id = payload.invocation_id or trace_id
     operation = payload.operation
-    started_at = time.perf_counter()
+    common = dict(trace_id=trace_id, invocation_id=invocation_id, service_id=payload.service_id)
 
     if operation == "hybrid_submit":
-        workload = payload.payload
         return _run_qcg_hybrid_workload(
-            workload,
-            http_request,
-            invocation_id=invocation_id,
-            service_id=payload.service_id,
-            operation=operation,
-            workload_type=str(workload.get("workload_type", "GENERAL")),
-            problem_size=int(workload.get("problem_size", 0)),
-            is_qubo_compatible=bool(workload.get("is_qubo_compatible", False)),
-            requires_entanglement=bool(workload.get("requires_entanglement", False)),
-            requires_live_hardware=bool(workload.get("requires_live_hardware", False)),
-            classical_fallback_acceptable=bool(workload.get("classical_fallback_acceptable", True)),
+            payload.payload, http_request, operation=operation, **common,
+        )
+    if operation == "health_check":
+        return _qcg_simple_operation(health, operation=operation, **common)
+    if operation == "list_providers":
+        return _qcg_simple_operation(
+            lambda: {"providers": provider_capabilities(),
+                     "backend_health": provider_registry.backend_health()},
+            operation=operation, **common,
         )
 
-    if operation == "health_check":
-        result = health()
-        return JSONResponse(content={
-            "invocation_id": invocation_id,
-            "service_id": payload.service_id,
-            "operation": operation,
-            "status": "SUCCESS",
-            "response": result,
-            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
-            "trust_method": "CLASSICAL",
-            "evidence": {"trace_id": trace_id, "provenance_available": False},
-            "error": None,
-        })
-
-    if operation == "list_providers":
-        result = {
-            "providers": provider_capabilities(),
-            "backend_health": provider_registry.backend_health(),
-        }
-        return JSONResponse(content={
-            "invocation_id": invocation_id,
-            "service_id": payload.service_id,
-            "operation": operation,
-            "status": "SUCCESS",
-            "response": result,
-            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
-            "trust_method": "CLASSICAL",
-            "evidence": {"trace_id": trace_id, "provenance_available": False},
-            "error": None,
-        })
-
-    # Marine Runtime does not implement QCG's network-coordination contract.
-    duration = round((time.perf_counter() - started_at) * 1000, 2)
-    return JSONResponse(status_code=404, content={
-        "invocation_id": invocation_id,
-        "service_id": payload.service_id,
-        "operation": operation,
-        "status": "SERVICE_NOT_FOUND",
-        "response": None,
-        "duration_ms": duration,
-        "trust_method": "CLASSICAL",
-        "evidence": {"trace_id": trace_id, "provenance_available": False},
-        "error": f"Unsupported operation in Marine Runtime: {operation}",
-    })
+    started_at = time.perf_counter()
+    envelope = _qcg_failure_envelope(
+        invocation_id=invocation_id, service_id=payload.service_id, operation=operation,
+        trace_id=trace_id, started_at=started_at, status_str="SERVICE_NOT_FOUND",
+        error=f"Unsupported operation in Marine Runtime: {operation}",
+    )
+    envelope["response"] = None
+    return JSONResponse(status_code=404, content=envelope)
 
 
 @app.get("/api/v1/quantum/providers", tags=["Quantum"], dependencies=[Auth],
