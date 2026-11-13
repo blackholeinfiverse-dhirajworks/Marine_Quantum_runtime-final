@@ -24,6 +24,16 @@ ENVIRONMENT VARIABLES:
     IONQ_API_KEY        — Optional. Enables IonQ backend.
     LOG_LEVEL           — Optional. debug|info|warning. Default: info.
 
+QCG INTEGRATION (trace IDs & instrumentation):
+    - Send  X-Trace-ID: <id>  (1-128 chars: letters, digits, . _ : -).
+      If omitted, the server generates a UUID4. The effective trace ID is
+      echoed in the X-Trace-ID response header, in every JSON body
+      (success AND error) and in every log line.
+    - Extra endpoints: GET /api/v1/quantum/backend
+                       GET /api/v1/quantum/calibration
+    - Backend classification: SIMULATED AND TESTED (Qiskit AerSimulator).
+      Physical QPU execution has NOT been verified.
+
 ARCHITECTURE NOTE:
     This file is a thin HTTP transport layer over the Python runtime.
     All business logic stays inside src/. This file only handles:
@@ -35,8 +45,15 @@ ARCHITECTURE NOTE:
 
 import os
 import sys
+import re
+import time
+import uuid
 import logging
 import secrets
+import threading
+import contextvars
+from collections import deque
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 # Make the runtime importable regardless of working directory
@@ -49,6 +66,9 @@ try:
     from fastapi.security import APIKeyHeader
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
     from pydantic import BaseModel, Field
     import uvicorn
 except ImportError:
@@ -83,7 +103,37 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
     LOG_LEVEL = "INFO"
 
-logging.basicConfig(level=LOG_LEVEL)
+
+# ── Trace-ID plumbing ──────────────────────────────────────────────────────────
+# The trace ID lives in a ContextVar so concurrent requests never share one
+# (each request has its own context; sync endpoints run in a copied context).
+# A LogRecord factory stamps every log line with the active trace ID, so logs
+# emitted anywhere (including src/) carry it without touching that code.
+
+_TRACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}$")
+_trace_ctx: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "trace_id", default=None
+)
+
+
+def _new_trace_id() -> str:
+    return str(uuid.uuid4())
+
+
+_base_record_factory = logging.getLogRecordFactory()
+
+
+def _record_factory(*args, **kwargs):
+    record = _base_record_factory(*args, **kwargs)
+    record.trace_id = _trace_ctx.get() or "-"
+    return record
+
+
+logging.setLogRecordFactory(_record_factory)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [trace_id=%(trace_id)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger("marine_quantum_runtime")
 
 
@@ -105,12 +155,55 @@ app = FastAPI(
     license_info={"name": "Internal — BHIV Core"},
 )
 
+# Trace-ID middleware. Registered BEFORE CORSMiddleware so CORS stays the
+# outermost layer and its headers apply to every response, including the 400
+# returned for a malformed trace ID.
+
+@app.middleware("http")
+async def trace_id_middleware(request: Request, call_next):
+    supplied = request.headers.get("X-Trace-ID")
+    if supplied is not None and supplied.strip():
+        supplied = supplied.strip()
+        if not _TRACE_ID_RE.match(supplied):
+            tid = _new_trace_id()
+            # Log only the length of the rejected value (avoids log injection).
+            logger.warning(
+                "Rejected malformed X-Trace-ID (len=%d); issued trace_id=%s",
+                len(supplied), tid,
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "INVALID_TRACE_ID",
+                    "trace_id": tid,
+                    "detail": (
+                        "X-Trace-ID must be 1-128 characters: letters, digits, "
+                        "'.', '_', ':' or '-', starting with a letter or digit."
+                    ),
+                },
+                headers={"X-Trace-ID": tid},
+            )
+        tid = supplied
+    else:
+        tid = _new_trace_id()
+
+    request.state.trace_id = tid
+    token = _trace_ctx.set(tid)
+    try:
+        response = await call_next(request)
+    finally:
+        _trace_ctx.reset(token)
+    response.headers["X-Trace-ID"] = tid
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    expose_headers=["X-Trace-ID"],
 )
 
 
@@ -160,6 +253,21 @@ def verify_api_key(api_key: Optional[str] = Security(_api_key_scheme)) -> str:
 Auth = Security(verify_api_key)
 
 
+# ── Limits & backend identity (single source of truth) ────────────────────────
+
+MAX_QUBITS    = 29
+MIN_SHOTS     = 100
+MAX_SHOTS     = 100_000
+DEFAULT_SHOTS = 4096
+DEFAULT_SEED  = 42
+
+# What has actually been verified for this deployment. Do NOT change these
+# unless a different backend has been executed and verified end-to-end.
+VERIFIED_PROVIDER      = "aer"
+VERIFIED_BACKEND       = "aer_simulator"
+BACKEND_CLASSIFICATION = "SIMULATED AND TESTED"
+
+
 # ── Request / Response Models ──────────────────────────────────────────────────
 
 class SignalPayload(BaseModel):
@@ -197,10 +305,10 @@ class QuantumPipelinePayload(BaseModel):
 
 
 class CircuitExecuteRequest(BaseModel):
-    num_qubits:    int               = Field(..., ge=1, le=29)
+    num_qubits:    int               = Field(..., ge=1, le=MAX_QUBITS)
     gate_sequence: List[Dict[str, Any]]
-    shots:         int               = Field(4096, ge=100, le=100_000)
-    seed:          int               = Field(42)
+    shots:         int               = Field(DEFAULT_SHOTS, ge=MIN_SHOTS, le=MAX_SHOTS)
+    seed:          int               = Field(DEFAULT_SEED)
     preferred_provider: Optional[str]= Field(None, description="aer|local_simulator|ibm_runtime|ionq")
     require_simulator:  bool         = Field(True)
     require_real_hardware: bool      = Field(False)
@@ -240,6 +348,143 @@ def _runtime_status_to_http(status_str: str) -> int:
         "EXECUTION_FAILED":     503,
         "FAILED":               500,
     }.get(status_str, 500)
+
+
+# ── QCG integration helpers ───────────────────────────────────────────────────
+# Transport-level only: tracing, structural circuit checks, instrumentation.
+# No execution logic lives here — production_execute() stays the only pipeline.
+
+def _trace_id_for(request: Optional[Request]) -> str:
+    """Effective trace ID for this request (set by trace_id_middleware)."""
+    tid = getattr(getattr(request, "state", None), "trace_id", None)
+    return tid or _trace_ctx.get() or _new_trace_id()
+
+
+def _new_execution_id() -> str:
+    return f"EXEC-{uuid.uuid4().hex[:12].upper()}"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# Bounded, in-memory, per-process record of recent executions. Resets on
+# restart / redeploy. Holds metadata only — never payloads or credentials.
+_EXEC_LOG_MAX = 100
+_exec_log: "deque[Dict[str, Any]]" = deque(maxlen=_EXEC_LOG_MAX)
+_exec_log_lock = threading.Lock()
+
+
+def _record_execution(record: Dict[str, Any]) -> None:
+    with _exec_log_lock:
+        _exec_log.append(record)
+
+
+def _execution_log_snapshot() -> List[Dict[str, Any]]:
+    with _exec_log_lock:
+        return list(_exec_log)
+
+
+def _logical_depth(gate_sequence: List[Dict[str, Any]]) -> int:
+    """
+    Pre-transpilation depth estimate from the gate list (each gate occupies the
+    next free layer on all of its qubits). Not the transpiled circuit depth.
+    """
+    layer: Dict[int, int] = {}
+    depth = 0
+    for g in gate_sequence:
+        qs = g.get("qubits") if isinstance(g, dict) else None
+        if not isinstance(qs, list):
+            continue
+        qs = [q for q in qs if isinstance(q, int) and not isinstance(q, bool)]
+        if not qs:
+            continue
+        d = max(layer.get(q, 0) for q in qs) + 1
+        for q in qs:
+            layer[q] = d
+        depth = max(depth, d)
+    return depth
+
+
+def _validate_circuit(num_qubits: int, gate_sequence: List[Dict[str, Any]]) -> List[str]:
+    """
+    Structural checks only. Gate NAMES are not whitelisted here — the provider
+    layer owns the supported-gate set, and an unsupported gate comes back from
+    production_execute() as a structured, trace-tagged error. Extra gate keys
+    (e.g. params) are allowed, and a gate with no "qubits" key is passed through
+    to the runtime unchanged (keeps existing gate-sequence compatibility).
+    """
+    problems: List[str] = []
+    for i, g in enumerate(gate_sequence):
+        name = g.get("gate")
+        if not isinstance(name, str) or not name.strip():
+            problems.append(f"gate_sequence[{i}]: 'gate' must be a non-empty string")
+        if "qubits" not in g:
+            continue
+        qs = g["qubits"]
+        if (not isinstance(qs, list) or not qs
+                or any(not isinstance(q, int) or isinstance(q, bool) for q in qs)):
+            problems.append(f"gate_sequence[{i}] ({name!r}): 'qubits' must be a non-empty list of integers")
+            continue
+        bad = [q for q in qs if q < 0 or q >= num_qubits]
+        if bad:
+            problems.append(
+                f"gate_sequence[{i}] ({name!r}): qubit index {bad} out of range "
+                f"for num_qubits={num_qubits} (valid: 0..{num_qubits - 1})"
+            )
+        if len(set(qs)) != len(qs):
+            problems.append(f"gate_sequence[{i}] ({name!r}): duplicate qubit index in {qs}")
+        if len(problems) >= 20:
+            problems.append("... further problems omitted")
+            break
+    return problems
+
+
+_NESTED_KEYS = ("result", "execution", "output", "backend_info", "details", "metrics")
+
+
+def _pick(result: Dict[str, Any], *keys: str, kind: Optional[type] = None) -> Any:
+    """First matching value from the result (top level, then common sub-dicts)."""
+    containers = [result] + [result[n] for n in _NESTED_KEYS if isinstance(result.get(n), dict)]
+    for c in containers:
+        for k in keys:
+            v = c.get(k)
+            if v is None:
+                continue
+            if kind is None or (isinstance(v, kind) and not (kind is int and isinstance(v, bool))):
+                return v
+    return None
+
+
+def _find_key(obj: Any, key: str, _depth: int = 0) -> Any:
+    """Locate `key` (as dict key, or as a list item's backend_name) in a nested structure."""
+    if _depth > 6:
+        return None
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key, _depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict) and item.get("backend_name") == key:
+                return item
+            r = _find_key(item, key, _depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+def _availability_label(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        for k in ("availability", "status", "health", "state"):
+            if isinstance(entry.get(k), str):
+                return entry[k]
+    return "UNKNOWN"
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -299,28 +544,121 @@ def quantum_corrosion(payload: QuantumPipelinePayload):
 
 @app.post("/api/v1/quantum/execute", tags=["Quantum"], dependencies=[Auth],
           summary="Execute an arbitrary quantum circuit via provider abstraction")
-def circuit_execute(request: CircuitExecuteRequest):
+def circuit_execute(request: CircuitExecuteRequest, http_request: Request):
     """
     Accepts a provider-agnostic circuit spec and routes to the best
     available healthy backend. Supports automatic failover.
 
     Gate format: `{"gate": "h", "qubits": [0]}` — see Appendix A in the docs.
+
+    Optional header `X-Trace-ID` is propagated end-to-end; the effective ID is
+    returned in the `trace_id` body field and the `X-Trace-ID` response header.
+    All fields returned by the runtime are preserved; `trace_id`, `execution_id`
+    and `instrumentation` are added (plus `backend_name`, `provider_name`,
+    `is_simulator`, `measurement_counts` where the runtime result lets them be
+    derived without guessing).
     """
-    circuit = CircuitSpec(
-        num_qubits    = request.num_qubits,
-        gate_sequence = request.gate_sequence,
-        shots         = request.shots,
-        seed          = request.seed,
-    )
-    req = BackendRequirements(
-        min_qubits            = request.num_qubits,
-        min_shots             = request.shots,
-        preferred_provider    = request.preferred_provider,
-        require_simulator     = request.require_simulator,
-        require_real_hardware = request.require_real_hardware,
-    )
-    result = production_execute(circuit, req)
-    return JSONResponse(status_code=_runtime_status_to_http(result["status"]), content=result)
+    trace_id      = _trace_id_for(http_request)
+    started_at    = _utc_now_iso()
+    t0            = time.perf_counter()
+    instrumentation: Dict[str, Any] = {
+        "trace_id":            trace_id,
+        "execution_id":        _new_execution_id(),
+        "execution_timestamp": started_at,
+        "num_qubits":          request.num_qubits,
+        "shots":               request.shots,
+        "seed":                request.seed,
+        "gate_count":          len(request.gate_sequence),
+        "logical_depth":       _logical_depth(request.gate_sequence),  # pre-transpile estimate
+        "circuit_depth":       None,   # filled only if the runtime reports it
+        "backend_name":        None,
+        "duration_ms":         None,
+        "execution_status":    None,
+    }
+
+    def _close(status_str: str) -> None:
+        instrumentation["duration_ms"] = round((time.perf_counter() - t0) * 1000, 3)
+        instrumentation["execution_status"] = status_str
+        _record_execution(dict(instrumentation))
+        logger.info(
+            "quantum.execute execution_id=%s status=%s backend=%s qubits=%s shots=%s "
+            "seed=%s duration_ms=%s",
+            instrumentation["execution_id"], status_str, instrumentation["backend_name"],
+            request.num_qubits, request.shots, request.seed, instrumentation["duration_ms"],
+        )
+
+    # 1) Structural validation (cheap, before touching any backend)
+    problems = _validate_circuit(request.num_qubits, request.gate_sequence)
+    if problems:
+        _close("VALIDATION_ERROR")
+        return JSONResponse(status_code=422, content={
+            "status":          "VALIDATION_ERROR",
+            "trace_id":        trace_id,
+            "execution_id":    instrumentation["execution_id"],
+            "errors":          problems,
+            "instrumentation": dict(instrumentation),
+        })
+
+    # 2) Existing execution pipeline (backend selection, compilation, execution,
+    #    result retrieval all happen inside production_execute — unchanged).
+    try:
+        circuit = CircuitSpec(
+            num_qubits    = request.num_qubits,
+            gate_sequence = request.gate_sequence,
+            shots         = request.shots,
+            seed          = request.seed,
+        )
+        req = BackendRequirements(
+            min_qubits            = request.num_qubits,
+            min_shots             = request.shots,
+            preferred_provider    = request.preferred_provider,
+            require_simulator     = request.require_simulator,
+            require_real_hardware = request.require_real_hardware,
+        )
+        result = production_execute(circuit, req)
+    except Exception as exc:
+        logger.exception("quantum.execute unhandled error execution_id=%s", instrumentation["execution_id"])
+        _close("INTERNAL_ERROR")
+        return JSONResponse(status_code=500, content={
+            "status":          "INTERNAL_ERROR",
+            "trace_id":        trace_id,
+            "execution_id":    instrumentation["execution_id"],
+            "detail":          f"Execution failed with {type(exc).__name__}. "
+                               f"See server logs for trace_id={trace_id}.",
+            "instrumentation": dict(instrumentation),
+        })
+
+    status_str = str(result.get("status", "FAILED"))
+    http_code  = _runtime_status_to_http(status_str)
+
+    # 3) Preserve every runtime field; add trace/instrumentation on top.
+    body = dict(result)
+    if "trace_id" in body and body["trace_id"] != trace_id:
+        body["runtime_trace_id"] = body["trace_id"]
+    body["trace_id"] = trace_id
+    body.setdefault("execution_id", instrumentation["execution_id"])
+    instrumentation["execution_id"] = body["execution_id"]
+
+    backend_name  = _pick(result, "backend_name", "backend", kind=str)
+    provider_name = _pick(result, "provider_name", "provider", kind=str)
+    counts        = _pick(result, "measurement_counts", "counts", kind=dict)
+    is_sim        = _pick(result, "is_simulator", kind=bool)
+    if is_sim is None and backend_name == VERIFIED_BACKEND:
+        is_sim = True   # grounded in the verified classification of this backend
+    if backend_name and "backend_name" not in body:
+        body["backend_name"] = backend_name
+    if provider_name and "provider_name" not in body:
+        body["provider_name"] = provider_name
+    if counts is not None and "measurement_counts" not in body:
+        body["measurement_counts"] = counts
+    if is_sim is not None and "is_simulator" not in body:
+        body["is_simulator"] = is_sim
+
+    instrumentation["backend_name"]  = backend_name
+    instrumentation["circuit_depth"] = _pick(result, "circuit_depth", kind=int)
+    _close(status_str)
+    body["instrumentation"] = dict(instrumentation)
+    return JSONResponse(status_code=http_code, content=body)
 
 
 @app.get("/api/v1/quantum/providers", tags=["Quantum"], dependencies=[Auth],
@@ -341,6 +679,124 @@ def quantum_providers():
                 "hardware_constraints": constraints.to_dict() if constraints else None,
             })
     return enriched
+
+
+@app.get("/api/v1/quantum/backend", tags=["Quantum"], dependencies=[Auth],
+         summary="Backend identity, availability and honest classification")
+def quantum_backend(http_request: Request):
+    """
+    Reports the verified backend (Qiskit AerSimulator), its live availability
+    as seen by the provider registry, and the registry's view of other
+    providers. Physical QPU execution is reported as NOT verified.
+    """
+    trace_id = _trace_id_for(http_request)
+    errors: List[str] = []
+
+    health = None
+    try:
+        health = provider_registry.backend_health()
+    except Exception as exc:
+        logger.exception("quantum.backend: backend_health() failed")
+        errors.append(f"backend_health unavailable: {type(exc).__name__}")
+
+    caps = None
+    try:
+        caps = provider_capabilities()
+    except Exception as exc:
+        logger.exception("quantum.backend: provider_capabilities() failed")
+        errors.append(f"provider_capabilities unavailable: {type(exc).__name__}")
+
+    entry = _find_key(health, VERIFIED_BACKEND) if health is not None else None
+    return {
+        "status":               "SUCCESS" if not errors else "PARTIAL",
+        "trace_id":             trace_id,
+        "provider_name":        VERIFIED_PROVIDER,
+        "backend_name":         VERIFIED_BACKEND,
+        "backend_availability": _availability_label(entry),
+        "classification":       BACKEND_CLASSIFICATION,
+        "is_simulator":         True,
+        "hardware": {
+            "physical_qpu_execution_verified": False,
+            "availability": "NOT_VERIFIED",
+            "note": "No physical quantum hardware execution has been verified. "
+                    "Registry entries for IBM/IonQ below are configuration status only.",
+        },
+        "supported_configuration": {
+            "num_qubits":          {"min": 1, "max": MAX_QUBITS},
+            "shots":               {"min": MIN_SHOTS, "max": MAX_SHOTS, "default": DEFAULT_SHOTS},
+            "seed":                {"type": "integer", "default": DEFAULT_SEED},
+            "gate_sequence_item":  {"gate": "<name>", "qubits": ["<int>", "..."]},
+            "tested_configuration": {"num_qubits": 3, "shots": 1024, "seed": 42},
+        },
+        "registry_health":       health,
+        "provider_capabilities": _find_key(caps, VERIFIED_PROVIDER) if caps is not None else None,
+        "errors":                errors,
+    }
+
+
+@app.get("/api/v1/quantum/calibration", tags=["Quantum"], dependencies=[Auth],
+         summary="Calibration status and execution instrumentation")
+def quantum_calibration(http_request: Request):
+    """
+    AerSimulator is a simulator: no physical calibration data exists, and none
+    is fabricated here. Also exposes the instrumentation recorded per execution
+    (in-memory, bounded to the most recent executions, resets on restart).
+    """
+    trace_id = _trace_id_for(http_request)
+    errors: List[str] = []
+
+    noise_profile = None
+    try:
+        p = get_noise_profile(VERIFIED_BACKEND)
+        noise_profile = p.to_dict() if p else None
+    except Exception as exc:
+        logger.exception("quantum.calibration: get_noise_profile() failed")
+        errors.append(f"noise_profile unavailable: {type(exc).__name__}")
+
+    constraints = None
+    try:
+        c = get_hardware_constraints(VERIFIED_BACKEND)
+        constraints = c.to_dict() if c else None
+    except Exception as exc:
+        logger.exception("quantum.calibration: get_hardware_constraints() failed")
+        errors.append(f"hardware_constraints unavailable: {type(exc).__name__}")
+
+    log = _execution_log_snapshot()
+    by_status: Dict[str, int] = {}
+    for rec in log:
+        k = str(rec.get("execution_status"))
+        by_status[k] = by_status.get(k, 0) + 1
+
+    return {
+        "status":               "SUCCESS" if not errors else "PARTIAL",
+        "trace_id":             trace_id,
+        "provider_name":        VERIFIED_PROVIDER,
+        "backend_name":         VERIFIED_BACKEND,
+        "classification":       BACKEND_CLASSIFICATION,
+        "is_simulator":         True,
+        "calibration_available": False,
+        "calibration_status":   "NOT_APPLICABLE",
+        "calibration_note": "Physical calibration (T1/T2, gate/readout error) does not apply to a "
+                            "simulator and is not reported. No calibration values are fabricated.",
+        "backend_metadata": {
+            "noise_profile": noise_profile,
+            "noise_profile_note": "As returned by the runtime's get_noise_profile(); not evidence "
+                                  "of a physical device calibration.",
+            "hardware_constraints": constraints,
+        },
+        "instrumentation": {
+            "fields_recorded": [
+                "trace_id", "execution_id", "execution_timestamp", "num_qubits", "shots",
+                "seed", "gate_count", "logical_depth", "circuit_depth (if reported by runtime)",
+                "backend_name", "duration_ms", "execution_status",
+            ],
+            "storage": "in-memory, per-process, bounded; resets on restart",
+            "executions_recorded": len(log),
+            "by_status":           by_status,
+            "last_execution":      log[-1] if log else None,
+        },
+        "errors": errors,
+    }
 
 
 # ── Capability Platform ────────────────────────────────────────────────────────
@@ -465,13 +921,60 @@ def authority_audit():
 
 
 # ── Error handlers ─────────────────────────────────────────────────────────────
+# Every application-generated error carries trace_id (body + X-Trace-ID header).
+# Existing `detail` fields are preserved for backward compatibility.
+
+_HTTP_STATUS_NAMES = {
+    400: "BAD_REQUEST", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED", 409: "CONFLICT", 422: "VALIDATION_ERROR",
+}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    tid = _trace_id_for(request)
+    headers = dict(exc.headers or {})
+    headers["X-Trace-ID"] = tid
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status":   _HTTP_STATUS_NAMES.get(exc.status_code, "ERROR"),
+            "detail":   exc.detail,
+            "trace_id": tid,
+        },
+        headers=headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError):
+    tid = _trace_id_for(request)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status":   "VALIDATION_ERROR",
+            "detail":   jsonable_encoder(exc.errors()),
+            "trace_id": tid,
+        },
+        headers={"X-Trace-ID": tid},
+    )
+
 
 @app.exception_handler(Exception)
 async def global_error_handler(request: Request, exc: Exception):
-    logger.exception(f"Unhandled exception on {request.url}: {exc}")
+    tid = _trace_id_for(request)
+    # Full traceback goes to the server log (tagged with the trace ID);
+    # the client only gets the exception type, never internals.
+    logger.error("Unhandled exception on %s [trace_id=%s]", request.url.path, tid, exc_info=exc)
     return JSONResponse(
         status_code=500,
-        content={"status": "INTERNAL_ERROR", "detail": str(exc)},
+        content={
+            "status":   "INTERNAL_ERROR",
+            "detail":   f"Internal server error ({type(exc).__name__}). "
+                        f"Quote trace_id={tid} when reporting.",
+            "trace_id": tid,
+        },
+        headers={"X-Trace-ID": tid},
     )
 
 
